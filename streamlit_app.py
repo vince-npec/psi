@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 try:
     import potato_leaf_dashboard.tray_analyzer as tray_analyzer
@@ -39,9 +39,15 @@ FOOTER_TEXT = "© 2026 NPEC Innovation - Visualization Dashboard by Dr. Vinicius
 ZIP_IMAGE_TYPES = sorted(ext.lstrip(".") for ext in SUPPORTED_IMAGE_EXTENSIONS)
 
 
+def _open_rgb_image(image_bytes: bytes) -> Image.Image:
+    image = Image.open(io.BytesIO(image_bytes))
+    image.load()
+    return image.convert("RGB")
+
+
 @st.cache_data(show_spinner=False, max_entries=32)
 def _analyze_upload(image_bytes: bytes, tray_profile_key: str, tray_long_side_cm: float):
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = _open_rgb_image(image_bytes)
     return analyze_tray_image(
         np.array(image),
         tray_profile_key=tray_profile_key,
@@ -51,7 +57,7 @@ def _analyze_upload(image_bytes: bytes, tray_profile_key: str, tray_long_side_cm
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def _preview_from_bytes(image_bytes: bytes, max_edge: int) -> np.ndarray:
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = _open_rgb_image(image_bytes)
     return _resize_for_preview(np.array(image), max_edge=max_edge)
 
 
@@ -118,12 +124,22 @@ def _unique_export_stems(names: list[str]) -> list[str]:
     return stems
 
 
+def _should_skip_zip_member(member_name: str) -> bool:
+    normalized_path = Path(member_name.replace("\\", "/"))
+    parts = normalized_path.parts
+    if any(part == "__MACOSX" for part in parts):
+        return True
+    return normalized_path.name.startswith("._")
+
+
 @st.cache_data(show_spinner=False, max_entries=32)
 def _discover_zip_image_members(archive_bytes: bytes) -> list[dict[str, Any]]:
     members: list[dict[str, Any]] = []
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
         for info in zf.infolist():
             if info.is_dir():
+                continue
+            if _should_skip_zip_member(info.filename):
                 continue
             suffix = Path(info.filename).suffix.lower()
             if suffix not in SUPPORTED_IMAGE_EXTENSIONS:
@@ -149,6 +165,13 @@ def _get_item_bytes(item: dict[str, Any]) -> bytes:
     if item["kind"] == "direct":
         return item["bytes"]
     return _extract_zip_member_bytes(item["archive_bytes"], str(item["member_name"]))
+
+
+def _item_display_path(item: dict[str, Any]) -> str:
+    source_path = str(item.get("source_path", "") or "").strip()
+    if source_path:
+        return source_path
+    return str(item["name"])
 
 
 def _record_label(record: dict[str, Any]) -> str:
@@ -283,11 +306,32 @@ def _build_batch_payload(
     image_rows: list[dict[str, Any]] = []
     plant_frames = []
     leaf_frames = []
+    skipped_items: list[dict[str, str]] = []
     export_stems = _unique_export_stems([str(item["name"]) for item in file_items])
 
     for item, export_stem in zip(file_items, export_stems):
-        image_bytes = _get_item_bytes(item)
-        result = _analyze_upload(image_bytes, tray_profile_key, float(tray_long_side_cm))
+        image_label = _item_display_path(item)
+        try:
+            image_bytes = _get_item_bytes(item)
+            result = _analyze_upload(image_bytes, tray_profile_key, float(tray_long_side_cm))
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            skipped_items.append(
+                {
+                    "Image": str(item["name"]),
+                    "Source Path": image_label,
+                    "Reason": f"Skipped invalid image data ({type(exc).__name__}).",
+                }
+            )
+            continue
+        except Exception as exc:
+            skipped_items.append(
+                {
+                    "Image": str(item["name"]),
+                    "Source Path": image_label,
+                    "Reason": f"Processing failed ({type(exc).__name__}).",
+                }
+            )
+            continue
         record = {
             "name": item["name"],
             "export_stem": export_stem,
@@ -331,12 +375,14 @@ def _build_batch_payload(
     image_summary_df = pd.DataFrame(image_rows)
     plant_summary_df = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
     leaf_detail_df = pd.concat(leaf_frames, ignore_index=True) if leaf_frames else pd.DataFrame()
+    skipped_df = pd.DataFrame(skipped_items)
 
     return {
         "records": records,
         "image_summary_df": image_summary_df,
         "plant_summary_df": plant_summary_df,
         "leaf_detail_df": leaf_detail_df,
+        "skipped_df": skipped_df,
         "results_zip_bytes": _build_results_bundle_bytes(
             {
                 "records": records,
@@ -344,7 +390,9 @@ def _build_batch_payload(
                 "plant_summary_df": plant_summary_df,
                 "leaf_detail_df": leaf_detail_df,
             }
-        ),
+        )
+        if records
+        else b"",
     }
 
 
@@ -479,7 +527,11 @@ def main() -> None:
     zip_archive_count = 0
     for uploaded_archive in uploaded_archives or []:
         archive_bytes = uploaded_archive.getvalue()
-        archive_members = _discover_zip_image_members(archive_bytes)
+        try:
+            archive_members = _discover_zip_image_members(archive_bytes)
+        except zipfile.BadZipFile:
+            st.warning(f"`{uploaded_archive.name}` is not a readable zip archive and was skipped.")
+            continue
         if not archive_members:
             st.warning(f"`{uploaded_archive.name}` did not contain any supported tray images.")
             continue
@@ -513,6 +565,16 @@ def main() -> None:
     image_summary_df = batch_payload["image_summary_df"]
     plant_summary_df = batch_payload["plant_summary_df"]
     leaf_detail_df = batch_payload["leaf_detail_df"]
+    skipped_df = batch_payload["skipped_df"]
+
+    if not skipped_df.empty:
+        st.warning(f"Skipped {len(skipped_df)} file(s) that could not be decoded or processed.")
+        with st.expander("Skipped files", expanded=False):
+            st.dataframe(skipped_df, hide_index=True, use_container_width=True)
+
+    if not batch_payload["records"]:
+        st.error("No valid tray images were available to analyze from the uploaded files.")
+        return
 
     summary_col_1, summary_col_2, summary_col_3 = st.columns(3)
     with summary_col_1:

@@ -49,4 +49,5 @@ Recommended settings:
 - The app supports `Auto`, `Potato / Soybean (2x2)`, and `Arabidopsis (4x5)` tray layouts.
 - The deployed Community Cloud app is browser-upload only. Users can upload one image, a batch of images, or one or more `.zip` archives directly in the web UI.
 - The app can return a single downloadable results zip containing combined CSVs, per-image CSVs, original images, overlays, and mask outputs.
+- Invalid or non-image items inside uploads are skipped automatically so one bad file does not stop a batch run.
 - Physical traits are normalized from the tray long side, defaulting to `33 cm`.
