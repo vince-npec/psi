@@ -100,7 +100,9 @@ class TrayAnalysisResult:
     tray_long_side_px: float
     tray_long_side_cm: float
     pixels_per_cm: float | None
+    pixels_per_cm_override: float | None
     mm_per_pixel: float | None
+    scale_source: str
     plant_results: list[PlantLeafResult]
     segmentation_source: str
 
@@ -117,6 +119,7 @@ def analyze_tray_image(
     image_rgb: np.ndarray,
     tray_profile_key: str = AUTO_TRAY_PROFILE_KEY,
     tray_long_side_cm: float = TRAY_LONG_SIDE_CM,
+    pixels_per_cm_override: float | None = None,
 ) -> TrayAnalysisResult:
     """Analyze a top-down tray image with adaptive ownership assignment across the full tray."""
     image_rgb = _normalize_rgb_image(image_rgb)
@@ -126,7 +129,12 @@ def analyze_tray_image(
     tray_crop_bgr = image_bgr[tray_y0:tray_y1, tray_x0:tray_x1]
     tray_mask = _segment_leaf_mask(tray_crop_bgr)
     tray_profile = _resolve_tray_profile(tray_profile_key, tray_mask)
-    pixels_per_cm, mm_per_pixel = _tray_scale_from_long_side(tray_long_side_px, tray_long_side_cm)
+    pixels_per_cm_override = _normalize_optional_positive_float(pixels_per_cm_override)
+    pixels_per_cm, mm_per_pixel, scale_source = _resolve_scale_calibration(
+        tray_long_side_px=tray_long_side_px,
+        tray_long_side_cm=tray_long_side_cm,
+        pixels_per_cm_override=pixels_per_cm_override,
+    )
     plant_sites = _build_plant_regions(tray_bbox, image_bgr.shape[:2], tray_profile)
     ownership_masks = _assign_canopy_pixels_to_sites(tray_mask, plant_sites, tray_bbox)
 
@@ -167,7 +175,9 @@ def analyze_tray_image(
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
+            pixels_per_cm_override=pixels_per_cm_override,
             mm_per_pixel=mm_per_pixel,
+            scale_source=scale_source,
         )
 
         plant_result = PlantLeafResult(
@@ -207,7 +217,9 @@ def analyze_tray_image(
         tray_long_side_px=float(tray_long_side_px),
         tray_long_side_cm=float(tray_long_side_cm),
         pixels_per_cm=pixels_per_cm,
+        pixels_per_cm_override=pixels_per_cm_override,
         mm_per_pixel=mm_per_pixel,
+        scale_source=scale_source,
         plant_results=plant_results,
         segmentation_source=segmentation_source,
     )
@@ -344,6 +356,26 @@ def _tray_scale_from_long_side(tray_long_side_px: float, tray_long_side_cm: floa
     pixels_per_cm = float(tray_long_side_px) / float(tray_long_side_cm)
     mm_per_pixel = float(tray_long_side_cm * 10.0) / float(tray_long_side_px)
     return _round_or_none(pixels_per_cm, 4), _round_or_none(mm_per_pixel, 4)
+
+
+def _scale_from_pixels_per_cm(pixels_per_cm: float | None) -> tuple[float | None, float | None]:
+    if pixels_per_cm is None or pixels_per_cm <= 0:
+        return None, None
+    mm_per_pixel = 10.0 / float(pixels_per_cm)
+    return _round_or_none(pixels_per_cm, 4), _round_or_none(mm_per_pixel, 4)
+
+
+def _resolve_scale_calibration(
+    tray_long_side_px: float,
+    tray_long_side_cm: float,
+    pixels_per_cm_override: float | None,
+) -> tuple[float | None, float | None, str]:
+    if pixels_per_cm_override is not None and pixels_per_cm_override > 0:
+        pixels_per_cm, mm_per_pixel = _scale_from_pixels_per_cm(pixels_per_cm_override)
+        return pixels_per_cm, mm_per_pixel, "User pixels/cm override"
+
+    pixels_per_cm, mm_per_pixel = _tray_scale_from_long_side(tray_long_side_px, tray_long_side_cm)
+    return pixels_per_cm, mm_per_pixel, "Detected tray long side"
 
 
 def _resolve_tray_profile(requested_key: str, tray_mask_u8: np.ndarray) -> TrayProfile:
@@ -773,7 +805,9 @@ def _compute_trait_rows(
     tray_long_side_cm: float,
     tray_long_side_px: float,
     pixels_per_cm: float | None,
+    pixels_per_cm_override: float | None,
     mm_per_pixel: float | None,
+    scale_source: str,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     binary = mask_u8 > 0
     canopy_stats = _shape_stats_from_mask(binary)
@@ -816,6 +850,8 @@ def _compute_trait_rows(
                 "Tray Profile": tray_profile.name,
                 "Grid Rows": int(tray_profile.rows),
                 "Grid Columns": int(tray_profile.cols),
+                "Scale Source": scale_source,
+                "Pixels Per Cm Override": pixels_per_cm_override,
                 "Leaf ID": int(leaf_id),
                 "Ownership Distance (px)": _round_or_none(ownership_distance_px, 2),
                 "Ownership Distance (cm)": _length_px_to_cm(ownership_distance_px, pixels_per_cm),
@@ -872,9 +908,11 @@ def _compute_trait_rows(
         "Tray Profile": tray_profile.name,
         "Grid Rows": int(tray_profile.rows),
         "Grid Columns": int(tray_profile.cols),
+        "Scale Source": scale_source,
         "Tray Long Side (px)": _round_or_none(tray_long_side_px, 2),
         "Tray Long Side (cm)": float(tray_long_side_cm),
         "Pixels Per Cm": pixels_per_cm,
+        "Pixels Per Cm Override": pixels_per_cm_override,
         "Mm Per Pixel": mm_per_pixel,
         "Estimated Leaves": int(len(leaf_rows)),
         "Canopy Area (px)": int(canopy_stats["area_px"]),
@@ -934,6 +972,18 @@ def _compute_trait_rows(
         "ExG Mean": canopy_color["exg_mean"],
     }
     return plant_row, leaf_rows
+
+
+def _normalize_optional_positive_float(value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric) or numeric <= 0:
+        return None
+    return numeric
 
 
 def _count_connected_segments(mask_bool: np.ndarray, min_area_px: int = 50) -> int:

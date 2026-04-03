@@ -13,9 +13,9 @@ import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
 try:
-    import potato_leaf_dashboard.tray_analyzer as tray_analyzer
-except ImportError:  # pragma: no cover - Streamlit script execution fallback
     import tray_analyzer
+except ImportError:  # pragma: no cover - packaged execution fallback
+    import potato_leaf_dashboard.tray_analyzer as tray_analyzer
 
 tray_analyzer.MAX_PLANT_ANALYSIS_DIM = max(int(getattr(tray_analyzer, "MAX_PLANT_ANALYSIS_DIM", 0) or 0), 4000)
 analyze_tray_image = tray_analyzer.analyze_tray_image
@@ -46,12 +46,18 @@ def _open_rgb_image(image_bytes: bytes) -> Image.Image:
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
-def _analyze_upload(image_bytes: bytes, tray_profile_key: str, tray_long_side_cm: float):
+def _analyze_upload(
+    image_bytes: bytes,
+    tray_profile_key: str,
+    tray_long_side_cm: float,
+    pixels_per_cm_override: float | None = None,
+):
     image = _open_rgb_image(image_bytes)
     return analyze_tray_image(
         np.array(image),
         tray_profile_key=tray_profile_key,
         tray_long_side_cm=float(tray_long_side_cm),
+        pixels_per_cm_override=pixels_per_cm_override,
     )
 
 
@@ -177,6 +183,18 @@ def _coerce_tray_long_side_cm(value: Any, fallback: float) -> float:
     return tray_long_side_cm
 
 
+def _coerce_optional_pixels_per_cm(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        pixels_per_cm = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(pixels_per_cm) or pixels_per_cm <= 0:
+        return None
+    return pixels_per_cm
+
+
 def _item_display_path(item: dict[str, Any]) -> str:
     source_path = str(item.get("source_path", "") or "").strip()
     if source_path:
@@ -206,25 +224,29 @@ def _safe_zip_path(path_str: str) -> str:
 
 
 def _build_scale_editor_df(file_items: list[dict[str, Any]], default_tray_long_side_cm: float) -> pd.DataFrame:
-    overrides = st.session_state.setdefault("per_image_tray_long_side_cm", {})
+    tray_overrides = st.session_state.setdefault("per_image_tray_long_side_cm", {})
+    pixels_per_cm_overrides = st.session_state.setdefault("per_image_pixels_per_cm_override", {})
     active_keys: list[str] = []
     rows: list[dict[str, Any]] = []
 
     for idx, item in enumerate(file_items):
         item_key = f"{idx}::{_item_display_path(item)}"
         active_keys.append(item_key)
-        resolved_scale = _coerce_tray_long_side_cm(overrides.get(item_key, default_tray_long_side_cm), default_tray_long_side_cm)
+        resolved_scale = _coerce_tray_long_side_cm(tray_overrides.get(item_key, default_tray_long_side_cm), default_tray_long_side_cm)
         rows.append(
             {
                 "_Item Key": item_key,
                 "Image": str(item["name"]),
                 "Source Path": _item_display_path(item),
                 "Tray Long Side (cm)": resolved_scale,
+                "Pixels Per Cm Override": _coerce_optional_pixels_per_cm(pixels_per_cm_overrides.get(item_key)),
             }
         )
 
-    for stale_key in [key for key in list(overrides) if key not in active_keys]:
-        overrides.pop(stale_key, None)
+    for stale_key in [key for key in list(tray_overrides) if key not in active_keys]:
+        tray_overrides.pop(stale_key, None)
+    for stale_key in [key for key in list(pixels_per_cm_overrides) if key not in active_keys]:
+        pixels_per_cm_overrides.pop(stale_key, None)
 
     return pd.DataFrame(rows)
 
@@ -320,8 +342,12 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
                         f"Image: {record['name']}",
                         f"Source: {source_path}",
                         f"Tray Profile: {result.tray_profile_name}",
+                        f"Scale Source: {result.scale_source}",
                         f"Tray Long Side (cm): {result.tray_long_side_cm}",
                         f"Tray Long Side (px): {result.tray_long_side_px}",
+                        f"Pixels Per Cm Override: {result.pixels_per_cm_override}",
+                        f"Pixels Per Cm: {result.pixels_per_cm}",
+                        f"Mm Per Pixel: {result.mm_per_pixel}",
                     ]
                 )
                 + "\n",
@@ -335,6 +361,7 @@ def _build_batch_payload(
     file_items: list[dict[str, Any]],
     tray_profile_key: str,
     tray_long_side_values_cm: tuple[float, ...],
+    pixels_per_cm_override_values: tuple[float | None, ...],
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     image_rows: list[dict[str, Any]] = []
@@ -345,12 +372,25 @@ def _build_batch_payload(
     resolved_tray_long_side_values_cm = list(tray_long_side_values_cm)
     if len(resolved_tray_long_side_values_cm) != len(file_items):
         resolved_tray_long_side_values_cm = [DEFAULT_TRAY_LONG_SIDE_CM] * len(file_items)
+    resolved_pixels_per_cm_override_values = list(pixels_per_cm_override_values)
+    if len(resolved_pixels_per_cm_override_values) != len(file_items):
+        resolved_pixels_per_cm_override_values = [None] * len(file_items)
 
-    for item, export_stem, tray_long_side_cm in zip(file_items, export_stems, resolved_tray_long_side_values_cm):
+    for item, export_stem, tray_long_side_cm, pixels_per_cm_override in zip(
+        file_items,
+        export_stems,
+        resolved_tray_long_side_values_cm,
+        resolved_pixels_per_cm_override_values,
+    ):
         image_label = _item_display_path(item)
         try:
             image_bytes = _get_item_bytes(item)
-            result = _analyze_upload(image_bytes, tray_profile_key, _coerce_tray_long_side_cm(tray_long_side_cm, DEFAULT_TRAY_LONG_SIDE_CM))
+            result = _analyze_upload(
+                image_bytes,
+                tray_profile_key,
+                _coerce_tray_long_side_cm(tray_long_side_cm, DEFAULT_TRAY_LONG_SIDE_CM),
+                _coerce_optional_pixels_per_cm(pixels_per_cm_override),
+            )
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
                 {
@@ -397,6 +437,7 @@ def _build_batch_payload(
                 "Tray Profile": result.tray_profile_name,
                 "Grid Rows": result.grid_rows,
                 "Grid Columns": result.grid_cols,
+                "Scale Source": result.scale_source,
                 "Estimated Leaves": int(result.plant_summary_df["Estimated Leaves"].sum()),
                 "Total Canopy Area (px)": int(result.plant_summary_df["Canopy Area (px)"].sum()),
                 "Total Canopy Area (cm^2)": round(float(result.plant_summary_df["Canopy Area (cm^2)"].fillna(0).sum()), 4),
@@ -404,6 +445,7 @@ def _build_batch_payload(
                 "Tray Long Side (px)": result.tray_long_side_px,
                 "Tray Long Side (cm)": result.tray_long_side_cm,
                 "Pixels Per Cm": result.pixels_per_cm,
+                "Pixels Per Cm Override": result.pixels_per_cm_override,
                 "Mm Per Pixel": result.mm_per_pixel,
                 "Segmentation": result.segmentation_source,
             }
@@ -476,7 +518,7 @@ def _render_record_detail(record: dict[str, Any]) -> None:
         st.metric("Total canopy area (cm^2)", round(float(result.plant_summary_df["Canopy Area (cm^2)"].fillna(0).sum()), 2))
         st.metric("Pixels / cm", result.pixels_per_cm if result.pixels_per_cm is not None else "n/a")
         st.caption(
-            f"Layout: {result.tray_profile_name} | Segmentation: {result.segmentation_source} | "
+            f"Layout: {result.tray_profile_name} | Scale: {result.scale_source} | Segmentation: {result.segmentation_source} | "
             f"Tray long side: {result.tray_long_side_cm:.1f} cm = {result.tray_long_side_px:.1f} px"
         )
 
@@ -592,9 +634,12 @@ def main() -> None:
         return
 
     st.subheader("Per-Image Scale")
-    st.caption("`33 cm` is the default tray long side. You can override it per image below, and the physical traits and exports will update to match.")
+    st.caption(
+        "`33 cm` is the default tray long side. You can override it per image below. "
+        "If `Pixels Per Cm Override` is filled, it takes priority for that image and is useful when no blue tray is visible."
+    )
     scale_editor_df = _build_scale_editor_df(file_items, float(tray_long_side_cm))
-    scale_apply_col, scale_note_col = st.columns([0.25, 0.75])
+    scale_apply_col, scale_clear_col, scale_note_col = st.columns([0.22, 0.22, 0.56])
     with scale_apply_col:
         if st.button(f"Apply {float(tray_long_side_cm):.2f} cm to all images", use_container_width=True):
             st.session_state["per_image_tray_long_side_cm"] = {
@@ -602,8 +647,12 @@ def main() -> None:
                 for _, row in scale_editor_df.iterrows()
             }
             st.rerun()
+    with scale_clear_col:
+        if st.button("Clear pixels/cm overrides", use_container_width=True):
+            st.session_state["per_image_pixels_per_cm_override"] = {}
+            st.rerun()
     with scale_note_col:
-        st.caption("Use the global tray value above as your starting point, then edit only the images that need a different scale.")
+        st.caption("Use the global tray value above as your starting point, then edit only the images that need a different tray size or a direct pixels/cm calibration.")
 
     edited_scale_df = st.data_editor(
         scale_editor_df,
@@ -620,14 +669,30 @@ def main() -> None:
                 format="%.2f",
                 help="Override the physical tray long side used to convert pixels into cm for this image.",
             ),
+            "Pixels Per Cm Override": st.column_config.NumberColumn(
+                "Pixels Per Cm Override",
+                min_value=0.0001,
+                step=0.1,
+                format="%.4f",
+                help="Optional direct calibration. When provided, this overrides tray-based scale detection for this image.",
+            ),
         },
     )
     st.session_state["per_image_tray_long_side_cm"] = {
         str(row["_Item Key"]): _coerce_tray_long_side_cm(row["Tray Long Side (cm)"], float(tray_long_side_cm))
         for _, row in edited_scale_df.iterrows()
     }
+    st.session_state["per_image_pixels_per_cm_override"] = {
+        str(row["_Item Key"]): _coerce_optional_pixels_per_cm(row.get("Pixels Per Cm Override"))
+        for _, row in edited_scale_df.iterrows()
+        if _coerce_optional_pixels_per_cm(row.get("Pixels Per Cm Override")) is not None
+    }
     tray_long_side_values_cm = tuple(
         _coerce_tray_long_side_cm(row["Tray Long Side (cm)"], float(tray_long_side_cm))
+        for _, row in edited_scale_df.iterrows()
+    )
+    pixels_per_cm_override_values = tuple(
+        _coerce_optional_pixels_per_cm(row.get("Pixels Per Cm Override"))
         for _, row in edited_scale_df.iterrows()
     )
 
@@ -636,6 +701,7 @@ def main() -> None:
             file_items=file_items,
             tray_profile_key=tray_profile_key,
             tray_long_side_values_cm=tray_long_side_values_cm,
+            pixels_per_cm_override_values=pixels_per_cm_override_values,
         )
     results_bundle_name = _results_bundle_name(file_items)
 
