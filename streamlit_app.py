@@ -167,6 +167,16 @@ def _get_item_bytes(item: dict[str, Any]) -> bytes:
     return _extract_zip_member_bytes(item["archive_bytes"], str(item["member_name"]))
 
 
+def _coerce_tray_long_side_cm(value: Any, fallback: float) -> float:
+    try:
+        tray_long_side_cm = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if not np.isfinite(tray_long_side_cm) or tray_long_side_cm <= 0:
+        return float(fallback)
+    return tray_long_side_cm
+
+
 def _item_display_path(item: dict[str, Any]) -> str:
     source_path = str(item.get("source_path", "") or "").strip()
     if source_path:
@@ -193,6 +203,30 @@ def _results_bundle_name(file_items: list[dict[str, Any]]) -> str:
 def _safe_zip_path(path_str: str) -> str:
     parts = [part for part in Path(path_str.replace("\\", "/")).parts if part not in {"", ".", ".."}]
     return "/".join(parts) or "image"
+
+
+def _build_scale_editor_df(file_items: list[dict[str, Any]], default_tray_long_side_cm: float) -> pd.DataFrame:
+    overrides = st.session_state.setdefault("per_image_tray_long_side_cm", {})
+    active_keys: list[str] = []
+    rows: list[dict[str, Any]] = []
+
+    for idx, item in enumerate(file_items):
+        item_key = f"{idx}::{_item_display_path(item)}"
+        active_keys.append(item_key)
+        resolved_scale = _coerce_tray_long_side_cm(overrides.get(item_key, default_tray_long_side_cm), default_tray_long_side_cm)
+        rows.append(
+            {
+                "_Item Key": item_key,
+                "Image": str(item["name"]),
+                "Source Path": _item_display_path(item),
+                "Tray Long Side (cm)": resolved_scale,
+            }
+        )
+
+    for stale_key in [key for key in list(overrides) if key not in active_keys]:
+        overrides.pop(stale_key, None)
+
+    return pd.DataFrame(rows)
 
 
 def _png_bytes_from_array(image: np.ndarray) -> bytes:
@@ -300,7 +334,7 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
 def _build_batch_payload(
     file_items: list[dict[str, Any]],
     tray_profile_key: str,
-    tray_long_side_cm: float,
+    tray_long_side_values_cm: tuple[float, ...],
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     image_rows: list[dict[str, Any]] = []
@@ -308,12 +342,15 @@ def _build_batch_payload(
     leaf_frames = []
     skipped_items: list[dict[str, str]] = []
     export_stems = _unique_export_stems([str(item["name"]) for item in file_items])
+    resolved_tray_long_side_values_cm = list(tray_long_side_values_cm)
+    if len(resolved_tray_long_side_values_cm) != len(file_items):
+        resolved_tray_long_side_values_cm = [DEFAULT_TRAY_LONG_SIDE_CM] * len(file_items)
 
-    for item, export_stem in zip(file_items, export_stems):
+    for item, export_stem, tray_long_side_cm in zip(file_items, export_stems, resolved_tray_long_side_values_cm):
         image_label = _item_display_path(item)
         try:
             image_bytes = _get_item_bytes(item)
-            result = _analyze_upload(image_bytes, tray_profile_key, float(tray_long_side_cm))
+            result = _analyze_upload(image_bytes, tray_profile_key, _coerce_tray_long_side_cm(tray_long_side_cm, DEFAULT_TRAY_LONG_SIDE_CM))
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
                 {
@@ -554,11 +591,51 @@ def main() -> None:
         st.info("Upload one or more top-down tray images or a zip archive of images to analyze them together.")
         return
 
+    st.subheader("Per-Image Scale")
+    st.caption("`33 cm` is the default tray long side. You can override it per image below, and the physical traits and exports will update to match.")
+    scale_editor_df = _build_scale_editor_df(file_items, float(tray_long_side_cm))
+    scale_apply_col, scale_note_col = st.columns([0.25, 0.75])
+    with scale_apply_col:
+        if st.button(f"Apply {float(tray_long_side_cm):.2f} cm to all images", use_container_width=True):
+            st.session_state["per_image_tray_long_side_cm"] = {
+                str(row["_Item Key"]): float(tray_long_side_cm)
+                for _, row in scale_editor_df.iterrows()
+            }
+            st.rerun()
+    with scale_note_col:
+        st.caption("Use the global tray value above as your starting point, then edit only the images that need a different scale.")
+
+    edited_scale_df = st.data_editor(
+        scale_editor_df,
+        hide_index=True,
+        use_container_width=True,
+        key="per_image_scale_editor",
+        disabled=["_Item Key", "Image", "Source Path"],
+        column_config={
+            "_Item Key": None,
+            "Tray Long Side (cm)": st.column_config.NumberColumn(
+                "Tray Long Side (cm)",
+                min_value=1.0,
+                step=0.1,
+                format="%.2f",
+                help="Override the physical tray long side used to convert pixels into cm for this image.",
+            ),
+        },
+    )
+    st.session_state["per_image_tray_long_side_cm"] = {
+        str(row["_Item Key"]): _coerce_tray_long_side_cm(row["Tray Long Side (cm)"], float(tray_long_side_cm))
+        for _, row in edited_scale_df.iterrows()
+    }
+    tray_long_side_values_cm = tuple(
+        _coerce_tray_long_side_cm(row["Tray Long Side (cm)"], float(tray_long_side_cm))
+        for _, row in edited_scale_df.iterrows()
+    )
+
     with st.spinner(f"Analyzing {len(file_items)} image(s)..."):
         batch_payload = _build_batch_payload(
             file_items=file_items,
             tray_profile_key=tray_profile_key,
-            tray_long_side_cm=float(tray_long_side_cm),
+            tray_long_side_values_cm=tray_long_side_values_cm,
         )
     results_bundle_name = _results_bundle_name(file_items)
 
