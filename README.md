@@ -7,7 +7,7 @@ Streamlit Community Cloud-ready app for potato, soybean, and Arabidopsis tray ph
 - `streamlit_app.py`: Streamlit entrypoint for Community Cloud
 - `tray_analyzer.py`: tray segmentation, ownership, and trait extraction
 - `requirements.txt`: Python dependencies for deployment
-- `batch_input/` and `batch_output/`: optional local batch folders
+- `batch_input/` and `batch_output/`: optional leftover local batch folders
 
 ## GitHub Push
 
@@ -47,5 +47,5 @@ Recommended settings:
 ## Notes
 
 - The app supports `Auto`, `Potato / Soybean (2x2)`, and `Arabidopsis (4x5)` tray layouts.
-- On Streamlit Community Cloud, use `Upload files`. The `Folder path` mode is mainly for local or self-hosted runs because cloud apps cannot browse a visitor's local disk.
+- The deployed Community Cloud app is browser-upload only. Users can upload one image or a batch of images directly in the web UI.
 - Physical traits are normalized from the tray long side, defaulting to `33 cm`.

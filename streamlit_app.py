@@ -30,7 +30,6 @@ st.set_page_config(
 
 MAX_PREVIEW_EDGE = 1400
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-CLOUD_HINT = "On Streamlit Community Cloud, use 'Upload files'. The 'Folder path' mode is mainly for local or self-hosted runs."
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -261,43 +260,17 @@ def main() -> None:
     if tray_profile_key == DEFAULT_TRAY_PROFILE_KEY:
         st.caption("Auto layout chooses between a 4-plant 2x2 tray and a 20-plant 4x5 Arabidopsis tray from the canopy pattern.")
 
-    input_mode = st.radio("Input mode", ["Upload files", "Folder path"], horizontal=True)
-    if input_mode == "Folder path":
-        st.caption(CLOUD_HINT)
+    uploaded_files = st.file_uploader(
+        "Tray images",
+        type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+        accept_multiple_files=True,
+    )
     file_items: list[dict[str, Any]] = []
-    output_folder_str = ""
-
-    if input_mode == "Upload files":
-        uploaded_files = st.file_uploader(
-            "Tray images",
-            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
-            accept_multiple_files=True,
-        )
-        for uploaded_file in uploaded_files or []:
-            file_items.append({"name": uploaded_file.name, "bytes": uploaded_file.getvalue(), "source_path": ""})
-        if not file_items:
-            st.info("Upload one or more top-down tray images to analyze them together.")
-            return
-    else:
-        app_root = Path(__file__).resolve().parent
-        default_input_dir = str((app_root / "batch_input").resolve())
-        default_output_dir = str((app_root / "batch_output").resolve())
-        folder_str = st.text_input("Input folder", value=default_input_dir)
-        output_folder_str = st.text_input("Output folder for lazy batch exports", value=default_output_dir)
-        image_paths = _discover_image_paths(folder_str)
-        if not image_paths:
-            st.info("Point to a folder containing `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tif`, or `.tiff` tray images.")
-            return
-        st.caption(f"Discovered {len(image_paths)} image(s) in `{Path(folder_str).expanduser()}`.")
-        for path in image_paths:
-            stat = path.stat()
-            file_items.append(
-                {
-                    "name": path.name,
-                    "bytes": _load_local_file_bytes(str(path), stat.st_mtime_ns),
-                    "source_path": str(path),
-                }
-            )
+    for uploaded_file in uploaded_files or []:
+        file_items.append({"name": uploaded_file.name, "bytes": uploaded_file.getvalue(), "source_path": ""})
+    if not file_items:
+        st.info("Upload one or more top-down tray images to analyze them together.")
+        return
 
     with st.spinner(f"Analyzing {len(file_items)} image(s)..."):
         batch_payload = _build_batch_payload(
@@ -344,11 +317,6 @@ def main() -> None:
             use_container_width=True,
         )
 
-    if input_mode == "Folder path" and output_folder_str.strip():
-        if st.button("Write Batch CSVs + Overlays To Output Folder", use_container_width=True):
-            written_paths = _write_batch_outputs(output_folder_str, batch_payload)
-            st.success(f"Wrote {len(written_paths)} batch output file(s) under {Path(output_folder_str).expanduser()}.")
-
     st.subheader("Batch Image Summary")
     st.dataframe(image_summary_df, hide_index=True, use_container_width=True)
 
@@ -366,9 +334,7 @@ def main() -> None:
     with st.expander("Batch Per-Leaf Table", expanded=False):
         st.dataframe(leaf_detail_df, hide_index=True, use_container_width=True, height=420)
 
-    st.caption(
-        "Folder mode is the lazy batch workflow: point the app at a directory of images, review the batch summary, and optionally write combined CSVs plus overlays to an output folder."
-    )
+    st.caption("Upload mode supports one image or batches of many images directly in the browser.")
 
 
 if __name__ == "__main__":
