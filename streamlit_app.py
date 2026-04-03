@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,9 @@ st.set_page_config(
 
 MAX_PREVIEW_EDGE = 1400
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+APP_ROOT = Path(__file__).resolve().parent
+LOGO_PATH = APP_ROOT / "assets" / "NPEC-logo-black.png"
+FOOTER_TEXT = "© 2026 NPEC Innovation - Visualization Dashboard by Dr. Vinicius Lube | Phenomics Engineer Innovation Lead"
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -61,6 +65,23 @@ def _resize_for_preview(image_rgb: np.ndarray, max_edge: int = MAX_PREVIEW_EDGE)
 
 def _csv_bytes(df) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _image_data_uri(path_str: str) -> str | None:
+    path = Path(path_str)
+    if not path.exists() or not path.is_file():
+        return None
+
+    mime_type = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -235,11 +256,24 @@ def _render_record_detail(record: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("Plant Tray Phenotyping Dashboard")
-    st.caption(
-        "Run potato, soybean, or Arabidopsis tray images, extract 2D plant and leaf traits, and export combined CSVs. "
-        "Physical measurements are normalized from the detected tray long side."
-    )
+    logo_data_uri = _image_data_uri(str(LOGO_PATH))
+    title_col, logo_col = st.columns([0.92, 0.08])
+    with title_col:
+        st.title("Plant Tray Phenotyping Dashboard")
+        st.caption(
+            "Run potato, soybean, or Arabidopsis tray images, extract 2D plant and leaf traits, and export combined CSVs. "
+            "Physical measurements are normalized from the detected tray long side."
+        )
+    with logo_col:
+        if logo_data_uri is not None:
+            st.markdown(
+                f"""
+                <div style="display:flex; justify-content:flex-end; padding-top:0.35rem;">
+                    <img src="{logo_data_uri}" alt="NPEC logo" style="width:64px; height:auto;" />
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     settings_col_1, settings_col_2 = st.columns([1.3, 0.8])
     tray_profile_key = settings_col_1.selectbox(
@@ -335,6 +369,11 @@ def main() -> None:
         st.dataframe(leaf_detail_df, hide_index=True, use_container_width=True, height=420)
 
     st.caption("Upload mode supports one image or batches of many images directly in the browser.")
+    st.markdown("---")
+    st.markdown(
+        f"<div style='text-align:center; font-size:0.9rem; color:rgba(250,250,250,0.65);'>{FOOTER_TEXT}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
