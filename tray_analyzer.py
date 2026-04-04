@@ -103,6 +103,9 @@ class TrayAnalysisResult:
     grid_rows: int
     grid_cols: int
     container_source: str
+    circle_center_x_shift_ratio: float
+    circle_center_y_shift_ratio: float
+    circle_radius_scale: float
     tray_long_side_px: float
     tray_long_side_cm: float
     pixels_per_cm: float | None
@@ -142,14 +145,23 @@ def analyze_tray_image(
     custom_site_pad_ratio: float | None = None,
     container_mode: str = CONTAINER_MODE_AUTO,
     circular_container_inset_ratio: float = 0.04,
+    circle_center_x_shift_ratio: float = 0.0,
+    circle_center_y_shift_ratio: float = 0.0,
+    circle_radius_scale: float = 1.0,
 ) -> TrayAnalysisResult:
     """Analyze a top-down tray image with adaptive ownership assignment across the full tray."""
     image_rgb = _normalize_rgb_image(image_rgb)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    circle_center_x_shift_ratio = _clip_ratio(circle_center_x_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
+    circle_center_y_shift_ratio = _clip_ratio(circle_center_y_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
+    circle_radius_scale = _clip_ratio(circle_radius_scale, 1.0, minimum=0.2, maximum=3.0)
     tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
         image_bgr,
         container_mode=container_mode,
         circular_container_inset_ratio=circular_container_inset_ratio,
+        circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+        circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+        circle_radius_scale=circle_radius_scale,
     )
     tray_x0, tray_y0, tray_x1, tray_y1 = tray_bbox
     tray_crop_bgr = image_bgr[tray_y0:tray_y1, tray_x0:tray_x1]
@@ -208,6 +220,9 @@ def analyze_tray_image(
             min_leaf_area_px=min_leaf_area_px,
             tray_profile=tray_profile,
             container_source=container_source,
+            circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+            circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+            circle_radius_scale=circle_radius_scale,
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
@@ -251,6 +266,9 @@ def analyze_tray_image(
         grid_rows=tray_profile.rows,
         grid_cols=tray_profile.cols,
         container_source=container_source,
+        circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+        circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+        circle_radius_scale=circle_radius_scale,
         tray_long_side_px=float(tray_long_side_px),
         tray_long_side_cm=float(tray_long_side_cm),
         pixels_per_cm=pixels_per_cm,
@@ -278,6 +296,9 @@ def _detect_container_geometry(
     image_bgr: np.ndarray,
     container_mode: str = CONTAINER_MODE_AUTO,
     circular_container_inset_ratio: float = 0.04,
+    circle_center_x_shift_ratio: float = 0.0,
+    circle_center_y_shift_ratio: float = 0.0,
+    circle_radius_scale: float = 1.0,
 ) -> tuple[tuple[int, int, int, int], float, np.ndarray, str]:
     """Detect a rectangular tray, circular chamber, or fall back to the full image."""
     if container_mode in {CONTAINER_MODE_AUTO, CONTAINER_MODE_RECTANGLE}:
@@ -289,6 +310,10 @@ def _detect_container_geometry(
         circle_candidate = _detect_circular_container_geometry(
             image_bgr,
             circular_container_inset_ratio=circular_container_inset_ratio,
+            circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+            circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+            circle_radius_scale=circle_radius_scale,
+            allow_default_circle=(container_mode == CONTAINER_MODE_CIRCLE),
         )
         if circle_candidate is not None:
             return circle_candidate
@@ -337,6 +362,10 @@ def _detect_rectangular_tray_geometry(
 def _detect_circular_container_geometry(
     image_bgr: np.ndarray,
     circular_container_inset_ratio: float = 0.04,
+    circle_center_x_shift_ratio: float = 0.0,
+    circle_center_y_shift_ratio: float = 0.0,
+    circle_radius_scale: float = 1.0,
+    allow_default_circle: bool = False,
 ) -> tuple[tuple[int, int, int, int], float, np.ndarray, str] | None:
     height, width = image_bgr.shape[:2]
     working_bgr, scale = _downscale_for_analysis(image_bgr, MAX_TRAY_ANALYSIS_DIM)
@@ -355,25 +384,31 @@ def _detect_circular_container_geometry(
         maxRadius=max(60, int(min_dim * 0.49)),
     )
     if circles is None:
-        return None
+        if not allow_default_circle:
+            return None
+        center_x = image_w // 2
+        center_y = image_h // 2
+        radius = int(round(min_dim * 0.42))
+        source_label = "Default circular pot"
+    else:
+        candidates = np.round(circles[0]).astype(np.int32)
+        best_candidate: tuple[int, int, int] | None = None
+        best_score = -1e9
+        for center_x, center_y, radius in candidates.tolist():
+            if radius <= 0:
+                continue
+            center_distance = float(np.hypot(center_x - (image_w / 2.0), center_y - (image_h / 2.0))) / max(1.0, min_dim)
+            radius_ratio = float(radius) / float(max(1, min_dim))
+            score = (radius_ratio * 3.0) - center_distance
+            if score > best_score:
+                best_score = score
+                best_candidate = (int(center_x), int(center_y), int(radius))
 
-    candidates = np.round(circles[0]).astype(np.int32)
-    best_candidate: tuple[int, int, int] | None = None
-    best_score = -1e9
-    for center_x, center_y, radius in candidates.tolist():
-        if radius <= 0:
-            continue
-        center_distance = float(np.hypot(center_x - (image_w / 2.0), center_y - (image_h / 2.0))) / max(1.0, min_dim)
-        radius_ratio = float(radius) / float(max(1, min_dim))
-        score = (radius_ratio * 3.0) - center_distance
-        if score > best_score:
-            best_score = score
-            best_candidate = (int(center_x), int(center_y), int(radius))
+        if best_candidate is None:
+            return None
 
-    if best_candidate is None:
-        return None
-
-    center_x, center_y, radius = best_candidate
+        center_x, center_y, radius = best_candidate
+        source_label = "Detected circular pot"
     inset_ratio = _clip_ratio(circular_container_inset_ratio, 0.04, minimum=0.0, maximum=0.2)
     effective_radius = max(12, int(round(radius * (1.0 - inset_ratio))))
     if scale != 1.0:
@@ -382,6 +417,12 @@ def _detect_circular_container_geometry(
         center_y = int(round(center_y * inv))
         radius = int(round(radius * inv))
         effective_radius = int(round(effective_radius * inv))
+
+    center_x = int(round(center_x + (width * circle_center_x_shift_ratio)))
+    center_y = int(round(center_y + (height * circle_center_y_shift_ratio)))
+    effective_radius = max(12, int(round(effective_radius * circle_radius_scale)))
+    center_x = int(min(width - 1, max(0, center_x)))
+    center_y = int(min(height - 1, max(0, center_y)))
 
     mask = np.zeros((height, width), dtype=np.uint8)
     cv2.circle(mask, (center_x, center_y), max(1, effective_radius), 255, thickness=-1)
@@ -394,7 +435,13 @@ def _detect_circular_container_geometry(
     if bbox[2] - bbox[0] < 30 or bbox[3] - bbox[1] < 30:
         return None
 
-    return bbox, max(1.0, float(radius * 2.0)), mask, "Detected circular pot"
+    adjusted = (
+        abs(circle_center_x_shift_ratio) > 1e-6
+        or abs(circle_center_y_shift_ratio) > 1e-6
+        or abs(circle_radius_scale - 1.0) > 1e-6
+    )
+    source = f"{source_label} + user adjustment" if adjusted else source_label
+    return bbox, max(1.0, float(effective_radius * 2.0)), mask, source
 
 
 def _segment_blue_tray_mask(image_bgr: np.ndarray) -> np.ndarray:
@@ -975,6 +1022,9 @@ def _compute_trait_rows(
     min_leaf_area_px: int,
     tray_profile: TrayProfile,
     container_source: str,
+    circle_center_x_shift_ratio: float,
+    circle_center_y_shift_ratio: float,
+    circle_radius_scale: float,
     tray_long_side_cm: float,
     tray_long_side_px: float,
     pixels_per_cm: float | None,
@@ -1024,6 +1074,9 @@ def _compute_trait_rows(
                 "Grid Rows": int(tray_profile.rows),
                 "Grid Columns": int(tray_profile.cols),
                 "Container Source": container_source,
+                "Circle Center X Shift (%)": _round_or_none(circle_center_x_shift_ratio * 100.0, 2),
+                "Circle Center Y Shift (%)": _round_or_none(circle_center_y_shift_ratio * 100.0, 2),
+                "Circle Radius Scale (%)": _round_or_none(circle_radius_scale * 100.0, 2),
                 "Scale Source": scale_source,
                 "Pixels Per Cm Override": pixels_per_cm_override,
                 "Leaf ID": int(leaf_id),
@@ -1083,6 +1136,9 @@ def _compute_trait_rows(
         "Grid Rows": int(tray_profile.rows),
         "Grid Columns": int(tray_profile.cols),
         "Container Source": container_source,
+        "Circle Center X Shift (%)": _round_or_none(circle_center_x_shift_ratio * 100.0, 2),
+        "Circle Center Y Shift (%)": _round_or_none(circle_center_y_shift_ratio * 100.0, 2),
+        "Circle Radius Scale (%)": _round_or_none(circle_radius_scale * 100.0, 2),
         "Scale Source": scale_source,
         "Tray Long Side (px)": _round_or_none(tray_long_side_px, 2),
         "Tray Long Side (cm)": float(tray_long_side_cm),

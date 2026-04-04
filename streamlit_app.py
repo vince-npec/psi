@@ -60,6 +60,9 @@ def _analyze_upload(
     custom_outer_pad_ratio: float | None = None,
     custom_site_pad_ratio: float | None = None,
     container_mode: str = DEFAULT_CONTAINER_MODE,
+    circle_center_x_shift_ratio: float = 0.0,
+    circle_center_y_shift_ratio: float = 0.0,
+    circle_radius_scale: float = 1.0,
 ):
     image = _open_rgb_image(image_bytes)
     return analyze_tray_image(
@@ -72,6 +75,9 @@ def _analyze_upload(
         custom_outer_pad_ratio=custom_outer_pad_ratio,
         custom_site_pad_ratio=custom_site_pad_ratio,
         container_mode=container_mode,
+        circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+        circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+        circle_radius_scale=circle_radius_scale,
     )
 
 
@@ -209,6 +215,26 @@ def _coerce_optional_pixels_per_cm(value: Any) -> float | None:
     return pixels_per_cm
 
 
+def _coerce_circle_shift_pct(value: Any) -> float:
+    try:
+        shift_pct = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(shift_pct):
+        return 0.0
+    return float(min(75.0, max(-75.0, shift_pct)))
+
+
+def _coerce_circle_size_pct(value: Any) -> float:
+    try:
+        size_pct = float(value)
+    except (TypeError, ValueError):
+        return 100.0
+    if not np.isfinite(size_pct):
+        return 100.0
+    return float(min(300.0, max(20.0, size_pct)))
+
+
 def _item_display_path(item: dict[str, Any]) -> str:
     source_path = str(item.get("source_path", "") or "").strip()
     if source_path:
@@ -261,6 +287,37 @@ def _build_scale_editor_df(file_items: list[dict[str, Any]], default_tray_long_s
         tray_overrides.pop(stale_key, None)
     for stale_key in [key for key in list(pixels_per_cm_overrides) if key not in active_keys]:
         pixels_per_cm_overrides.pop(stale_key, None)
+
+    return pd.DataFrame(rows)
+
+
+def _build_circle_adjustment_editor_df(file_items: list[dict[str, Any]]) -> pd.DataFrame:
+    x_shift_overrides = st.session_state.setdefault("per_image_circle_center_x_shift_pct", {})
+    y_shift_overrides = st.session_state.setdefault("per_image_circle_center_y_shift_pct", {})
+    radius_scale_overrides = st.session_state.setdefault("per_image_circle_radius_scale_pct", {})
+    active_keys: list[str] = []
+    rows: list[dict[str, Any]] = []
+
+    for idx, item in enumerate(file_items):
+        item_key = f"{idx}::{_item_display_path(item)}"
+        active_keys.append(item_key)
+        rows.append(
+            {
+                "_Item Key": item_key,
+                "Image": str(item["name"]),
+                "Source Path": _item_display_path(item),
+                "Circle X Shift (%)": _coerce_circle_shift_pct(x_shift_overrides.get(item_key, 0.0)),
+                "Circle Y Shift (%)": _coerce_circle_shift_pct(y_shift_overrides.get(item_key, 0.0)),
+                "Circle Size (%)": _coerce_circle_size_pct(radius_scale_overrides.get(item_key, 100.0)),
+            }
+        )
+
+    for stale_key in [key for key in list(x_shift_overrides) if key not in active_keys]:
+        x_shift_overrides.pop(stale_key, None)
+    for stale_key in [key for key in list(y_shift_overrides) if key not in active_keys]:
+        y_shift_overrides.pop(stale_key, None)
+    for stale_key in [key for key in list(radius_scale_overrides) if key not in active_keys]:
+        radius_scale_overrides.pop(stale_key, None)
 
     return pd.DataFrame(rows)
 
@@ -357,6 +414,9 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
                         f"Source: {source_path}",
                         f"Tray Profile: {result.tray_profile_name}",
                         f"Container Source: {result.container_source}",
+                        f"Circle X Shift (%): {round(float(result.circle_center_x_shift_ratio) * 100.0, 2)}",
+                        f"Circle Y Shift (%): {round(float(result.circle_center_y_shift_ratio) * 100.0, 2)}",
+                        f"Circle Size (%): {round(float(result.circle_radius_scale) * 100.0, 2)}",
                         f"Scale Source: {result.scale_source}",
                         f"Tray Long Side (cm): {result.tray_long_side_cm}",
                         f"Tray Long Side (px): {result.tray_long_side_px}",
@@ -382,6 +442,9 @@ def _build_batch_payload(
     custom_outer_pad_ratio: float | None = None,
     custom_site_pad_ratio: float | None = None,
     container_mode: str = DEFAULT_CONTAINER_MODE,
+    circle_center_x_shift_ratios: tuple[float, ...] = (),
+    circle_center_y_shift_ratios: tuple[float, ...] = (),
+    circle_radius_scales: tuple[float, ...] = (),
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     image_rows: list[dict[str, Any]] = []
@@ -395,12 +458,24 @@ def _build_batch_payload(
     resolved_pixels_per_cm_override_values = list(pixels_per_cm_override_values)
     if len(resolved_pixels_per_cm_override_values) != len(file_items):
         resolved_pixels_per_cm_override_values = [None] * len(file_items)
+    resolved_circle_center_x_shift_ratios = list(circle_center_x_shift_ratios)
+    if len(resolved_circle_center_x_shift_ratios) != len(file_items):
+        resolved_circle_center_x_shift_ratios = [0.0] * len(file_items)
+    resolved_circle_center_y_shift_ratios = list(circle_center_y_shift_ratios)
+    if len(resolved_circle_center_y_shift_ratios) != len(file_items):
+        resolved_circle_center_y_shift_ratios = [0.0] * len(file_items)
+    resolved_circle_radius_scales = list(circle_radius_scales)
+    if len(resolved_circle_radius_scales) != len(file_items):
+        resolved_circle_radius_scales = [1.0] * len(file_items)
 
-    for item, export_stem, tray_long_side_cm, pixels_per_cm_override in zip(
+    for item, export_stem, tray_long_side_cm, pixels_per_cm_override, circle_center_x_shift_ratio, circle_center_y_shift_ratio, circle_radius_scale in zip(
         file_items,
         export_stems,
         resolved_tray_long_side_values_cm,
         resolved_pixels_per_cm_override_values,
+        resolved_circle_center_x_shift_ratios,
+        resolved_circle_center_y_shift_ratios,
+        resolved_circle_radius_scales,
     ):
         image_label = _item_display_path(item)
         try:
@@ -415,6 +490,9 @@ def _build_batch_payload(
                 custom_outer_pad_ratio=custom_outer_pad_ratio,
                 custom_site_pad_ratio=custom_site_pad_ratio,
                 container_mode=container_mode,
+                circle_center_x_shift_ratio=float(circle_center_x_shift_ratio),
+                circle_center_y_shift_ratio=float(circle_center_y_shift_ratio),
+                circle_radius_scale=float(circle_radius_scale),
             )
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
@@ -463,6 +541,9 @@ def _build_batch_payload(
                 "Grid Rows": result.grid_rows,
                 "Grid Columns": result.grid_cols,
                 "Container Source": result.container_source,
+                "Circle X Shift (%)": round(float(result.circle_center_x_shift_ratio) * 100.0, 2),
+                "Circle Y Shift (%)": round(float(result.circle_center_y_shift_ratio) * 100.0, 2),
+                "Circle Size (%)": round(float(result.circle_radius_scale) * 100.0, 2),
                 "Scale Source": result.scale_source,
                 "Estimated Leaves": int(result.plant_summary_df["Estimated Leaves"].sum()),
                 "Total Canopy Area (px)": int(result.plant_summary_df["Canopy Area (px)"].sum()),
@@ -547,6 +628,12 @@ def _render_record_detail(record: dict[str, Any]) -> None:
             f"Layout: {result.tray_profile_name} | Container: {result.container_source} | Scale: {result.scale_source} | Segmentation: {result.segmentation_source} | "
             f"Tray long side: {result.tray_long_side_cm:.1f} cm = {result.tray_long_side_px:.1f} px"
         )
+        if "circular pot" in str(result.container_source).lower():
+            st.caption(
+                f"Circle adjustment: x {round(float(result.circle_center_x_shift_ratio) * 100.0, 1)}% | "
+                f"y {round(float(result.circle_center_y_shift_ratio) * 100.0, 1)}% | "
+                f"size {round(float(result.circle_radius_scale) * 100.0, 1)}%"
+            )
 
     export_col_1, export_col_2 = st.columns(2)
     with export_col_1:
@@ -779,6 +866,81 @@ def main() -> None:
         for _, row in edited_scale_df.iterrows()
     )
 
+    st.subheader("Per-Image Circular Mask Adjustment")
+    st.caption(
+        "These controls let you move or enlarge the circular container mask per image. "
+        "They matter for `Circular pot / chamber`, and are ignored for `Rectangle tray` or `Full image`."
+    )
+    circle_editor_df = _build_circle_adjustment_editor_df(file_items)
+    circle_reset_col, circle_note_col = st.columns([0.22, 0.78])
+    with circle_reset_col:
+        if st.button("Reset circle adjustments", use_container_width=True):
+            st.session_state["per_image_circle_center_x_shift_pct"] = {}
+            st.session_state["per_image_circle_center_y_shift_pct"] = {}
+            st.session_state["per_image_circle_radius_scale_pct"] = {}
+            st.rerun()
+    with circle_note_col:
+        st.caption("Positive X moves right, positive Y moves down, and size above `100%` makes the circle larger.")
+
+    edited_circle_df = st.data_editor(
+        circle_editor_df,
+        hide_index=True,
+        use_container_width=True,
+        key="per_image_circle_editor",
+        disabled=["_Item Key", "Image", "Source Path"],
+        column_config={
+            "_Item Key": None,
+            "Circle X Shift (%)": st.column_config.NumberColumn(
+                "Circle X Shift (%)",
+                min_value=-75.0,
+                max_value=75.0,
+                step=1.0,
+                format="%.1f",
+                help="Shift the detected circle horizontally as a percent of image width.",
+            ),
+            "Circle Y Shift (%)": st.column_config.NumberColumn(
+                "Circle Y Shift (%)",
+                min_value=-75.0,
+                max_value=75.0,
+                step=1.0,
+                format="%.1f",
+                help="Shift the detected circle vertically as a percent of image height.",
+            ),
+            "Circle Size (%)": st.column_config.NumberColumn(
+                "Circle Size (%)",
+                min_value=20.0,
+                max_value=300.0,
+                step=1.0,
+                format="%.1f",
+                help="Scale the detected circle radius. `100%` keeps the original size.",
+            ),
+        },
+    )
+    st.session_state["per_image_circle_center_x_shift_pct"] = {
+        str(row["_Item Key"]): _coerce_circle_shift_pct(row.get("Circle X Shift (%)"))
+        for _, row in edited_circle_df.iterrows()
+    }
+    st.session_state["per_image_circle_center_y_shift_pct"] = {
+        str(row["_Item Key"]): _coerce_circle_shift_pct(row.get("Circle Y Shift (%)"))
+        for _, row in edited_circle_df.iterrows()
+    }
+    st.session_state["per_image_circle_radius_scale_pct"] = {
+        str(row["_Item Key"]): _coerce_circle_size_pct(row.get("Circle Size (%)"))
+        for _, row in edited_circle_df.iterrows()
+    }
+    circle_center_x_shift_ratios = tuple(
+        _coerce_circle_shift_pct(row.get("Circle X Shift (%)")) / 100.0
+        for _, row in edited_circle_df.iterrows()
+    )
+    circle_center_y_shift_ratios = tuple(
+        _coerce_circle_shift_pct(row.get("Circle Y Shift (%)")) / 100.0
+        for _, row in edited_circle_df.iterrows()
+    )
+    circle_radius_scales = tuple(
+        _coerce_circle_size_pct(row.get("Circle Size (%)")) / 100.0
+        for _, row in edited_circle_df.iterrows()
+    )
+
     with st.spinner(f"Analyzing {len(file_items)} image(s)..."):
         batch_payload = _build_batch_payload(
             file_items=file_items,
@@ -790,6 +952,9 @@ def main() -> None:
             custom_outer_pad_ratio=(None if custom_outer_pad_pct is None else float(custom_outer_pad_pct) / 100.0),
             custom_site_pad_ratio=(None if custom_site_pad_pct is None else float(custom_site_pad_pct) / 100.0),
             container_mode=container_mode,
+            circle_center_x_shift_ratios=circle_center_x_shift_ratios,
+            circle_center_y_shift_ratios=circle_center_y_shift_ratios,
+            circle_radius_scales=circle_radius_scales,
         )
     results_bundle_name = _results_bundle_name(file_items)
 
