@@ -21,7 +21,11 @@ tray_analyzer.MAX_PLANT_ANALYSIS_DIM = max(int(getattr(tray_analyzer, "MAX_PLANT
 analyze_tray_image = tray_analyzer.analyze_tray_image
 TRAY_PROFILE_OPTIONS = tray_analyzer.get_tray_profile_options()
 TRAY_PROFILE_LABELS = {key: label for key, label in TRAY_PROFILE_OPTIONS}
+CONTAINER_MODE_OPTIONS = tray_analyzer.get_container_mode_options()
+CONTAINER_MODE_LABELS = {key: label for key, label in CONTAINER_MODE_OPTIONS}
 DEFAULT_TRAY_PROFILE_KEY = getattr(tray_analyzer, "AUTO_TRAY_PROFILE_KEY", TRAY_PROFILE_OPTIONS[0][0])
+CUSTOM_TRAY_PROFILE_KEY = getattr(tray_analyzer, "CUSTOM_TRAY_PROFILE_KEY", "custom")
+DEFAULT_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_AUTO", "auto")
 DEFAULT_TRAY_LONG_SIDE_CM = float(getattr(tray_analyzer, "TRAY_LONG_SIDE_CM", 33.0))
 
 
@@ -51,6 +55,11 @@ def _analyze_upload(
     tray_profile_key: str,
     tray_long_side_cm: float,
     pixels_per_cm_override: float | None = None,
+    custom_grid_rows: int | None = None,
+    custom_grid_cols: int | None = None,
+    custom_outer_pad_ratio: float | None = None,
+    custom_site_pad_ratio: float | None = None,
+    container_mode: str = DEFAULT_CONTAINER_MODE,
 ):
     image = _open_rgb_image(image_bytes)
     return analyze_tray_image(
@@ -58,6 +67,11 @@ def _analyze_upload(
         tray_profile_key=tray_profile_key,
         tray_long_side_cm=float(tray_long_side_cm),
         pixels_per_cm_override=pixels_per_cm_override,
+        custom_grid_rows=custom_grid_rows,
+        custom_grid_cols=custom_grid_cols,
+        custom_outer_pad_ratio=custom_outer_pad_ratio,
+        custom_site_pad_ratio=custom_site_pad_ratio,
+        container_mode=container_mode,
     )
 
 
@@ -342,6 +356,7 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
                         f"Image: {record['name']}",
                         f"Source: {source_path}",
                         f"Tray Profile: {result.tray_profile_name}",
+                        f"Container Source: {result.container_source}",
                         f"Scale Source: {result.scale_source}",
                         f"Tray Long Side (cm): {result.tray_long_side_cm}",
                         f"Tray Long Side (px): {result.tray_long_side_px}",
@@ -362,6 +377,11 @@ def _build_batch_payload(
     tray_profile_key: str,
     tray_long_side_values_cm: tuple[float, ...],
     pixels_per_cm_override_values: tuple[float | None, ...],
+    custom_grid_rows: int | None = None,
+    custom_grid_cols: int | None = None,
+    custom_outer_pad_ratio: float | None = None,
+    custom_site_pad_ratio: float | None = None,
+    container_mode: str = DEFAULT_CONTAINER_MODE,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     image_rows: list[dict[str, Any]] = []
@@ -390,6 +410,11 @@ def _build_batch_payload(
                 tray_profile_key,
                 _coerce_tray_long_side_cm(tray_long_side_cm, DEFAULT_TRAY_LONG_SIDE_CM),
                 _coerce_optional_pixels_per_cm(pixels_per_cm_override),
+                custom_grid_rows=custom_grid_rows,
+                custom_grid_cols=custom_grid_cols,
+                custom_outer_pad_ratio=custom_outer_pad_ratio,
+                custom_site_pad_ratio=custom_site_pad_ratio,
+                container_mode=container_mode,
             )
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
@@ -437,6 +462,7 @@ def _build_batch_payload(
                 "Tray Profile": result.tray_profile_name,
                 "Grid Rows": result.grid_rows,
                 "Grid Columns": result.grid_cols,
+                "Container Source": result.container_source,
                 "Scale Source": result.scale_source,
                 "Estimated Leaves": int(result.plant_summary_df["Estimated Leaves"].sum()),
                 "Total Canopy Area (px)": int(result.plant_summary_df["Canopy Area (px)"].sum()),
@@ -518,7 +544,7 @@ def _render_record_detail(record: dict[str, Any]) -> None:
         st.metric("Total canopy area (cm^2)", round(float(result.plant_summary_df["Canopy Area (cm^2)"].fillna(0).sum()), 2))
         st.metric("Pixels / cm", result.pixels_per_cm if result.pixels_per_cm is not None else "n/a")
         st.caption(
-            f"Layout: {result.tray_profile_name} | Scale: {result.scale_source} | Segmentation: {result.segmentation_source} | "
+            f"Layout: {result.tray_profile_name} | Container: {result.container_source} | Scale: {result.scale_source} | Segmentation: {result.segmentation_source} | "
             f"Tray long side: {result.tray_long_side_cm:.1f} cm = {result.tray_long_side_px:.1f} px"
         )
 
@@ -569,7 +595,7 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
 
-    settings_col_1, settings_col_2 = st.columns([1.3, 0.8])
+    settings_col_1, settings_col_2, settings_col_3 = st.columns([1.15, 0.65, 0.7])
     tray_profile_key = settings_col_1.selectbox(
         "Tray layout",
         options=[key for key, _ in TRAY_PROFILE_OPTIONS],
@@ -585,8 +611,65 @@ def main() -> None:
         value=DEFAULT_TRAY_LONG_SIDE_CM,
         step=0.5,
     )
+    container_mode = settings_col_3.selectbox(
+        "Container geometry",
+        options=[key for key, _ in CONTAINER_MODE_OPTIONS],
+        index=next(
+            (idx for idx, (key, _) in enumerate(CONTAINER_MODE_OPTIONS) if key == DEFAULT_CONTAINER_MODE),
+            0,
+        ),
+        format_func=lambda key: CONTAINER_MODE_LABELS.get(key, key),
+    )
     if tray_profile_key == DEFAULT_TRAY_PROFILE_KEY:
         st.caption("Auto layout chooses between a 4-plant 2x2 tray and a 20-plant 4x5 Arabidopsis tray from the canopy pattern.")
+    if tray_profile_key == CUSTOM_TRAY_PROFILE_KEY:
+        custom_col_1, custom_col_2, custom_col_3, custom_col_4 = st.columns(4)
+        custom_grid_rows = int(
+            custom_col_1.number_input(
+                "Custom grid rows",
+                min_value=1,
+                max_value=20,
+                value=2,
+                step=1,
+            )
+        )
+        custom_grid_cols = int(
+            custom_col_2.number_input(
+                "Custom grid columns",
+                min_value=1,
+                max_value=20,
+                value=2,
+                step=1,
+            )
+        )
+        custom_outer_pad_pct = float(
+            custom_col_3.slider(
+                "Outer margin (%)",
+                min_value=0,
+                max_value=25,
+                value=5,
+                step=1,
+            )
+        )
+        custom_site_pad_pct = float(
+            custom_col_4.slider(
+                "Pot / site padding (%)",
+                min_value=0,
+                max_value=30,
+                value=6,
+                step=1,
+            )
+        )
+        st.caption(
+            "Universal mode works for arbitrary grids such as `1x1`, `1x2`, `2x1`, `3x4`, or `5x5`. "
+            "Use `Circular pot / chamber` when the growing area is round and you want wall reflections ignored, "
+            "and use `Full image` for open top-down tray or chamber photos where the whole field should be analyzed."
+        )
+    else:
+        custom_grid_rows = None
+        custom_grid_cols = None
+        custom_outer_pad_pct = None
+        custom_site_pad_pct = None
 
     uploaded_files = st.file_uploader(
         "Tray images",
@@ -702,6 +785,11 @@ def main() -> None:
             tray_profile_key=tray_profile_key,
             tray_long_side_values_cm=tray_long_side_values_cm,
             pixels_per_cm_override_values=pixels_per_cm_override_values,
+            custom_grid_rows=custom_grid_rows,
+            custom_grid_cols=custom_grid_cols,
+            custom_outer_pad_ratio=(None if custom_outer_pad_pct is None else float(custom_outer_pad_pct) / 100.0),
+            custom_site_pad_ratio=(None if custom_site_pad_pct is None else float(custom_site_pad_pct) / 100.0),
+            container_mode=container_mode,
         )
     results_bundle_name = _results_bundle_name(file_items)
 

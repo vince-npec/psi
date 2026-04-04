@@ -47,6 +47,7 @@ Recommended settings:
 ## Notes
 
 - The app supports `Auto`, `Potato / Soybean (2x2)`, and `Arabidopsis (4x5)` tray layouts.
+- `Universal / Custom Grid` lets you analyze arbitrary layouts such as `1x1`, `1x2`, `2x1`, `3x4`, or `5x5`, and pair them with `Auto`, `Rectangle tray`, `Circular pot / chamber`, or `Full image` container geometry.
 - The deployed Community Cloud app is browser-upload only. Users can upload one image, a batch of images, or one or more `.zip` archives directly in the web UI.
 - Each uploaded image can keep the default tray long side, use its own per-image tray-size override, or provide a direct `pixels per cm` override when no blue tray is visible.
 - The app can return a single downloadable results zip containing combined CSVs, per-image CSVs, original images, overlays, and mask outputs.

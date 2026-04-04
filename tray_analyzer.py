@@ -23,6 +23,11 @@ BASE_PLANT_COLORS_BGR = [
 AUTO_TRAY_PROFILE_KEY = "auto"
 GRID_2X2_PROFILE_KEY = "grid_2x2"
 GRID_4X5_PROFILE_KEY = "grid_4x5"
+CUSTOM_TRAY_PROFILE_KEY = "custom"
+CONTAINER_MODE_AUTO = "auto"
+CONTAINER_MODE_RECTANGLE = "rectangle"
+CONTAINER_MODE_CIRCLE = "circle"
+CONTAINER_MODE_FULL_IMAGE = "full_image"
 TRAY_LONG_SIDE_CM = 33.0
 MAX_TRAY_ANALYSIS_DIM = 1400
 MAX_PLANT_ANALYSIS_DIM = 3000
@@ -97,6 +102,7 @@ class TrayAnalysisResult:
     tray_profile_name: str
     grid_rows: int
     grid_cols: int
+    container_source: str
     tray_long_side_px: float
     tray_long_side_cm: float
     pixels_per_cm: float | None
@@ -112,6 +118,16 @@ def get_tray_profile_options() -> list[tuple[str, str]]:
         (AUTO_TRAY_PROFILE_KEY, "Auto (2x2 or 4x5)"),
         (GRID_2X2_PROFILE_KEY, TRAY_PROFILES[GRID_2X2_PROFILE_KEY].name),
         (GRID_4X5_PROFILE_KEY, TRAY_PROFILES[GRID_4X5_PROFILE_KEY].name),
+        (CUSTOM_TRAY_PROFILE_KEY, "Universal / Custom Grid"),
+    ]
+
+
+def get_container_mode_options() -> list[tuple[str, str]]:
+    return [
+        (CONTAINER_MODE_AUTO, "Auto detect"),
+        (CONTAINER_MODE_RECTANGLE, "Rectangle tray"),
+        (CONTAINER_MODE_CIRCLE, "Circular pot / chamber"),
+        (CONTAINER_MODE_FULL_IMAGE, "Full image"),
     ]
 
 
@@ -120,15 +136,33 @@ def analyze_tray_image(
     tray_profile_key: str = AUTO_TRAY_PROFILE_KEY,
     tray_long_side_cm: float = TRAY_LONG_SIDE_CM,
     pixels_per_cm_override: float | None = None,
+    custom_grid_rows: int | None = None,
+    custom_grid_cols: int | None = None,
+    custom_outer_pad_ratio: float | None = None,
+    custom_site_pad_ratio: float | None = None,
+    container_mode: str = CONTAINER_MODE_AUTO,
+    circular_container_inset_ratio: float = 0.04,
 ) -> TrayAnalysisResult:
     """Analyze a top-down tray image with adaptive ownership assignment across the full tray."""
     image_rgb = _normalize_rgb_image(image_rgb)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    tray_bbox, tray_long_side_px = _detect_tray_geometry(image_bgr)
+    tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
+        image_bgr,
+        container_mode=container_mode,
+        circular_container_inset_ratio=circular_container_inset_ratio,
+    )
     tray_x0, tray_y0, tray_x1, tray_y1 = tray_bbox
     tray_crop_bgr = image_bgr[tray_y0:tray_y1, tray_x0:tray_x1]
     tray_mask = _segment_leaf_mask(tray_crop_bgr)
-    tray_profile = _resolve_tray_profile(tray_profile_key, tray_mask)
+    tray_mask = cv2.bitwise_and(tray_mask, container_mask_u8[tray_y0:tray_y1, tray_x0:tray_x1])
+    tray_profile = _resolve_tray_profile(
+        tray_profile_key,
+        tray_mask,
+        custom_grid_rows=custom_grid_rows,
+        custom_grid_cols=custom_grid_cols,
+        custom_outer_pad_ratio=custom_outer_pad_ratio,
+        custom_site_pad_ratio=custom_site_pad_ratio,
+    )
     pixels_per_cm_override = _normalize_optional_positive_float(pixels_per_cm_override)
     pixels_per_cm, mm_per_pixel, scale_source = _resolve_scale_calibration(
         tray_long_side_px=tray_long_side_px,
@@ -154,6 +188,7 @@ def analyze_tray_image(
         crop_bgr = image_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
         crop_raw_mask_u8 = _segment_leaf_mask(crop_bgr)
         plant_mask_u8 = cv2.bitwise_and(crop_raw_mask_u8, owned_mask_u8)
+        plant_mask_u8 = cv2.bitwise_and(plant_mask_u8, container_mask_u8[crop_y0:crop_y1, crop_x0:crop_x1])
         plant_mask_u8 = _suppress_spurious_small_masks(
             plant_mask_u8=plant_mask_u8,
             analysis_bbox=analysis_bbox,
@@ -172,6 +207,7 @@ def analyze_tray_image(
             analysis_bbox=analysis_bbox,
             min_leaf_area_px=min_leaf_area_px,
             tray_profile=tray_profile,
+            container_source=container_source,
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
@@ -198,7 +234,7 @@ def analyze_tray_image(
         leaf_rows.extend(plant_leaf_rows)
         _draw_region_overlay(overlay_bgr, plant_result, color=_plant_color_bgr(idx, len(plant_sites)))
 
-    _draw_tray_outline(overlay_bgr, tray_bbox)
+    _draw_container_outline(overlay_bgr, tray_bbox, container_mask_u8)
     plant_summary_df = pd.DataFrame(plant_rows)
     leaf_detail_df = pd.DataFrame(leaf_rows)
     counts_df = plant_summary_df[["Plant", "Position", "Estimated Leaves"]].copy()
@@ -214,6 +250,7 @@ def analyze_tray_image(
         tray_profile_name=tray_profile.name,
         grid_rows=tray_profile.rows,
         grid_cols=tray_profile.cols,
+        container_source=container_source,
         tray_long_side_px=float(tray_long_side_px),
         tray_long_side_cm=float(tray_long_side_cm),
         pixels_per_cm=pixels_per_cm,
@@ -237,20 +274,46 @@ def _normalize_rgb_image(image_rgb: np.ndarray) -> np.ndarray:
     return image_rgb
 
 
-def _detect_tray_geometry(image_bgr: np.ndarray) -> tuple[tuple[int, int, int, int], float]:
+def _detect_container_geometry(
+    image_bgr: np.ndarray,
+    container_mode: str = CONTAINER_MODE_AUTO,
+    circular_container_inset_ratio: float = 0.04,
+) -> tuple[tuple[int, int, int, int], float, np.ndarray, str]:
+    """Detect a rectangular tray, circular chamber, or fall back to the full image."""
+    if container_mode in {CONTAINER_MODE_AUTO, CONTAINER_MODE_RECTANGLE}:
+        rectangle_candidate = _detect_rectangular_tray_geometry(image_bgr)
+        if rectangle_candidate is not None:
+            return rectangle_candidate
+
+    if container_mode in {CONTAINER_MODE_AUTO, CONTAINER_MODE_CIRCLE}:
+        circle_candidate = _detect_circular_container_geometry(
+            image_bgr,
+            circular_container_inset_ratio=circular_container_inset_ratio,
+        )
+        if circle_candidate is not None:
+            return circle_candidate
+
+    height, width = image_bgr.shape[:2]
+    full_mask = np.full((height, width), 255, dtype=np.uint8)
+    return (0, 0, width, height), float(max(width, height)), full_mask, "Full image fallback"
+
+
+def _detect_rectangular_tray_geometry(
+    image_bgr: np.ndarray,
+) -> tuple[tuple[int, int, int, int], float, np.ndarray, str] | None:
     """Find the blue tray carrier and estimate its long side in pixels."""
     height, width = image_bgr.shape[:2]
     working_bgr, scale = _downscale_for_analysis(image_bgr, MAX_TRAY_ANALYSIS_DIM)
     tray_mask = _segment_blue_tray_mask(working_bgr)
     tray_candidate = _select_tray_candidate(tray_mask)
     if tray_candidate is None:
-        fallback_long = float(max(width, height))
-        return (0, 0, width, height), fallback_long
+        return None
 
     contour, (x, y, w, h) = tray_candidate
     rect = cv2.minAreaRect(contour)
     rect_w, rect_h = rect[1]
     long_side_px = float(max(rect_w, rect_h, w, h))
+    full_mask = np.zeros((height, width), dtype=np.uint8)
     if scale != 1.0:
         inv = 1.0 / scale
         x = int(round(x * inv))
@@ -258,12 +321,80 @@ def _detect_tray_geometry(image_bgr: np.ndarray) -> tuple[tuple[int, int, int, i
         w = int(round(w * inv))
         h = int(round(h * inv))
         long_side_px = float(long_side_px * inv)
+        contour = np.round(contour.astype(np.float32) * inv).astype(np.int32)
+    else:
+        contour = contour.astype(np.int32)
     if w < 0.4 * width or h < 0.4 * height:
-        fallback_long = float(max(width, height))
-        return (0, 0, width, height), fallback_long
+        return None
 
     bbox = (max(0, x), max(0, y), min(width, x + w), min(height, y + h))
-    return bbox, max(1.0, float(long_side_px))
+    cv2.drawContours(full_mask, [contour], -1, 255, thickness=-1)
+    if not np.any(full_mask > 0):
+        full_mask[bbox[1] : bbox[3], bbox[0] : bbox[2]] = 255
+    return bbox, max(1.0, float(long_side_px)), full_mask, "Detected blue tray"
+
+
+def _detect_circular_container_geometry(
+    image_bgr: np.ndarray,
+    circular_container_inset_ratio: float = 0.04,
+) -> tuple[tuple[int, int, int, int], float, np.ndarray, str] | None:
+    height, width = image_bgr.shape[:2]
+    working_bgr, scale = _downscale_for_analysis(image_bgr, MAX_TRAY_ANALYSIS_DIM)
+    gray = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.medianBlur(gray, 9)
+    image_h, image_w = blur.shape[:2]
+    min_dim = min(image_h, image_w)
+    circles = cv2.HoughCircles(
+        blur,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(50, min_dim // 4),
+        param1=120,
+        param2=45,
+        minRadius=max(40, int(min_dim * 0.22)),
+        maxRadius=max(60, int(min_dim * 0.49)),
+    )
+    if circles is None:
+        return None
+
+    candidates = np.round(circles[0]).astype(np.int32)
+    best_candidate: tuple[int, int, int] | None = None
+    best_score = -1e9
+    for center_x, center_y, radius in candidates.tolist():
+        if radius <= 0:
+            continue
+        center_distance = float(np.hypot(center_x - (image_w / 2.0), center_y - (image_h / 2.0))) / max(1.0, min_dim)
+        radius_ratio = float(radius) / float(max(1, min_dim))
+        score = (radius_ratio * 3.0) - center_distance
+        if score > best_score:
+            best_score = score
+            best_candidate = (int(center_x), int(center_y), int(radius))
+
+    if best_candidate is None:
+        return None
+
+    center_x, center_y, radius = best_candidate
+    inset_ratio = _clip_ratio(circular_container_inset_ratio, 0.04, minimum=0.0, maximum=0.2)
+    effective_radius = max(12, int(round(radius * (1.0 - inset_ratio))))
+    if scale != 1.0:
+        inv = 1.0 / scale
+        center_x = int(round(center_x * inv))
+        center_y = int(round(center_y * inv))
+        radius = int(round(radius * inv))
+        effective_radius = int(round(effective_radius * inv))
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.circle(mask, (center_x, center_y), max(1, effective_radius), 255, thickness=-1)
+    bbox = (
+        max(0, center_x - effective_radius),
+        max(0, center_y - effective_radius),
+        min(width, center_x + effective_radius),
+        min(height, center_y + effective_radius),
+    )
+    if bbox[2] - bbox[0] < 30 or bbox[3] - bbox[1] < 30:
+        return None
+
+    return bbox, max(1.0, float(radius * 2.0)), mask, "Detected circular pot"
 
 
 def _segment_blue_tray_mask(image_bgr: np.ndarray) -> np.ndarray:
@@ -378,7 +509,22 @@ def _resolve_scale_calibration(
     return pixels_per_cm, mm_per_pixel, "Detected tray long side"
 
 
-def _resolve_tray_profile(requested_key: str, tray_mask_u8: np.ndarray) -> TrayProfile:
+def _resolve_tray_profile(
+    requested_key: str,
+    tray_mask_u8: np.ndarray,
+    custom_grid_rows: int | None = None,
+    custom_grid_cols: int | None = None,
+    custom_outer_pad_ratio: float | None = None,
+    custom_site_pad_ratio: float | None = None,
+) -> TrayProfile:
+    if requested_key == CUSTOM_TRAY_PROFILE_KEY:
+        return _build_custom_tray_profile(
+            custom_grid_rows=custom_grid_rows,
+            custom_grid_cols=custom_grid_cols,
+            custom_outer_pad_ratio=custom_outer_pad_ratio,
+            custom_site_pad_ratio=custom_site_pad_ratio,
+        )
+
     if requested_key in TRAY_PROFILES:
         return TRAY_PROFILES[requested_key]
 
@@ -386,6 +532,32 @@ def _resolve_tray_profile(requested_key: str, tray_mask_u8: np.ndarray) -> TrayP
     if group_count >= 12:
         return TRAY_PROFILES[GRID_4X5_PROFILE_KEY]
     return TRAY_PROFILES[GRID_2X2_PROFILE_KEY]
+
+
+def _build_custom_tray_profile(
+    custom_grid_rows: int | None = None,
+    custom_grid_cols: int | None = None,
+    custom_outer_pad_ratio: float | None = None,
+    custom_site_pad_ratio: float | None = None,
+) -> TrayProfile:
+    rows = max(1, int(custom_grid_rows or 1))
+    cols = max(1, int(custom_grid_cols or 1))
+    total_sites = rows * cols
+    default_outer_pad_ratio = 0.04 if total_sites >= 12 else 0.05
+    default_site_pad_ratio = 0.08 if total_sites >= 12 else 0.06
+    outer_pad_ratio = _clip_ratio(custom_outer_pad_ratio, default_outer_pad_ratio, minimum=0.0, maximum=0.25)
+    site_pad_ratio = _clip_ratio(custom_site_pad_ratio, default_site_pad_ratio, minimum=0.0, maximum=0.3)
+
+    return TrayProfile(
+        key=CUSTOM_TRAY_PROFILE_KEY,
+        name=f"Universal ({rows}x{cols})",
+        rows=rows,
+        cols=cols,
+        outer_pad_ratio_x=outer_pad_ratio,
+        outer_pad_ratio_y=outer_pad_ratio,
+        site_pad_ratio_x=site_pad_ratio,
+        site_pad_ratio_y=site_pad_ratio,
+    )
 
 
 def _estimate_plant_group_count(mask_u8: np.ndarray) -> int:
@@ -802,6 +974,7 @@ def _compute_trait_rows(
     analysis_bbox: tuple[int, int, int, int],
     min_leaf_area_px: int,
     tray_profile: TrayProfile,
+    container_source: str,
     tray_long_side_cm: float,
     tray_long_side_px: float,
     pixels_per_cm: float | None,
@@ -850,6 +1023,7 @@ def _compute_trait_rows(
                 "Tray Profile": tray_profile.name,
                 "Grid Rows": int(tray_profile.rows),
                 "Grid Columns": int(tray_profile.cols),
+                "Container Source": container_source,
                 "Scale Source": scale_source,
                 "Pixels Per Cm Override": pixels_per_cm_override,
                 "Leaf ID": int(leaf_id),
@@ -908,6 +1082,7 @@ def _compute_trait_rows(
         "Tray Profile": tray_profile.name,
         "Grid Rows": int(tray_profile.rows),
         "Grid Columns": int(tray_profile.cols),
+        "Container Source": container_source,
         "Scale Source": scale_source,
         "Tray Long Side (px)": _round_or_none(tray_long_side_px, 2),
         "Tray Long Side (cm)": float(tray_long_side_cm),
@@ -984,6 +1159,23 @@ def _normalize_optional_positive_float(value: float | int | None) -> float | Non
     if not np.isfinite(numeric) or numeric <= 0:
         return None
     return numeric
+
+
+def _clip_ratio(
+    value: float | int | None,
+    default: float,
+    minimum: float = 0.0,
+    maximum: float = 0.3,
+) -> float:
+    if value is None:
+        return float(default)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not np.isfinite(numeric):
+        return float(default)
+    return float(min(maximum, max(minimum, numeric)))
 
 
 def _count_connected_segments(mask_bool: np.ndarray, min_area_px: int = 50) -> int:
@@ -1222,6 +1414,15 @@ def _draw_region_overlay(image_bgr: np.ndarray, plant_result: PlantLeafResult, c
     )
 
 
-def _draw_tray_outline(image_bgr: np.ndarray, tray_bbox: tuple[int, int, int, int]) -> None:
+def _draw_container_outline(
+    image_bgr: np.ndarray,
+    tray_bbox: tuple[int, int, int, int],
+    container_mask_u8: np.ndarray,
+) -> None:
+    contours, _ = cv2.findContours((container_mask_u8 > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(image_bgr, contours, -1, (255, 255, 255), 2)
+        return
+
     x0, y0, x1, y1 = tray_bbox
     cv2.rectangle(image_bgr, (x0, y0), (x1, y1), (255, 255, 255), 2)
