@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import zipfile
 from pathlib import Path
@@ -49,7 +50,7 @@ def _open_rgb_image(image_bytes: bytes) -> Image.Image:
     return image.convert("RGB")
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_data(show_spinner=False, max_entries=12)
 def _analyze_upload(
     image_bytes: bytes,
     tray_profile_key: str,
@@ -181,7 +182,7 @@ def _discover_zip_image_members(archive_bytes: bytes) -> list[dict[str, Any]]:
     return members
 
 
-@st.cache_data(show_spinner=False, max_entries=2048)
+@st.cache_data(show_spinner=False, max_entries=128)
 def _extract_zip_member_bytes(archive_bytes: bytes, member_name: str) -> bytes:
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
         return zf.read(member_name)
@@ -340,7 +341,7 @@ def _colorize_label_map(label_map: np.ndarray) -> np.ndarray:
 
 
 def _build_mask_assets(result) -> dict[str, np.ndarray]:
-    image_h, image_w = result.original_rgb.shape[:2]
+    image_h, image_w = result.image_shape
     canopy_mask = np.zeros((image_h, image_w), dtype=np.uint8)
     plant_label_mask = np.zeros((image_h, image_w), dtype=np.uint8)
     leaf_label_mask = np.zeros((image_h, image_w), dtype=np.uint16)
@@ -431,7 +432,6 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
     return buffer.getvalue()
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
 def _build_batch_payload(
     file_items: list[dict[str, Any]],
     tray_profile_key: str,
@@ -569,17 +569,22 @@ def _build_batch_payload(
         "plant_summary_df": plant_summary_df,
         "leaf_detail_df": leaf_detail_df,
         "skipped_df": skipped_df,
-        "results_zip_bytes": _build_results_bundle_bytes(
-            {
-                "records": records,
-                "image_summary_df": image_summary_df,
-                "plant_summary_df": plant_summary_df,
-                "leaf_detail_df": leaf_detail_df,
-            }
-        )
-        if records
-        else b"",
     }
+
+
+def _results_zip_signature(batch_payload: dict[str, Any], results_bundle_name: str) -> str:
+    digest = hashlib.sha1()
+    digest.update(results_bundle_name.encode("utf-8"))
+    for key in ("image_summary_df", "plant_summary_df", "leaf_detail_df", "skipped_df"):
+        csv_bytes = _csv_bytes(batch_payload[key]) if key in batch_payload and isinstance(batch_payload[key], pd.DataFrame) else b""
+        digest.update(key.encode("utf-8"))
+        digest.update(csv_bytes)
+    for record in batch_payload.get("records", []):
+        digest.update(str(record.get("name", "")).encode("utf-8"))
+        digest.update(str(record.get("source_path", "")).encode("utf-8"))
+        digest.update(str(record["result"].container_source).encode("utf-8"))
+        digest.update(str(record["result"].scale_source).encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _write_batch_outputs(output_dir_str: str, batch_payload: dict[str, Any]) -> list[Path]:
@@ -957,6 +962,10 @@ def main() -> None:
             circle_radius_scales=circle_radius_scales,
         )
     results_bundle_name = _results_bundle_name(file_items)
+    results_zip_signature = _results_zip_signature(batch_payload, results_bundle_name)
+    if st.session_state.get("prepared_results_zip_signature") != results_zip_signature:
+        st.session_state.pop("prepared_results_zip_bytes", None)
+        st.session_state["prepared_results_zip_signature"] = results_zip_signature
 
     image_summary_df = batch_payload["image_summary_df"]
     plant_summary_df = batch_payload["plant_summary_df"]
@@ -1009,15 +1018,25 @@ def main() -> None:
             use_container_width=True,
         )
     with batch_export_col_4:
-        st.download_button(
-            "Download Full Results ZIP",
-            data=batch_payload["results_zip_bytes"],
-            file_name=results_bundle_name,
-            mime="application/zip",
-            use_container_width=True,
-        )
+        prepared_results_zip_bytes = st.session_state.get("prepared_results_zip_bytes")
+        if prepared_results_zip_bytes is None:
+            if st.button("Prepare Full Results ZIP", use_container_width=True):
+                with st.spinner("Preparing full results ZIP..."):
+                    st.session_state["prepared_results_zip_bytes"] = _build_results_bundle_bytes(batch_payload)
+                st.rerun()
+        else:
+            st.download_button(
+                "Download Full Results ZIP",
+                data=prepared_results_zip_bytes,
+                file_name=results_bundle_name,
+                mime="application/zip",
+                use_container_width=True,
+            )
 
-    st.caption("The results zip contains combined CSVs, per-image CSVs, original images, overlays, and mask outputs for every processed image.")
+    st.caption(
+        "The full results zip contains combined CSVs, per-image CSVs, original images, overlays, and mask outputs. "
+        "It is prepared on demand to keep the web app lighter."
+    )
 
     st.subheader("Batch Image Summary")
     st.dataframe(image_summary_df, hide_index=True, use_container_width=True)

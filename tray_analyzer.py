@@ -92,7 +92,7 @@ class PlantLeafResult:
 
 @dataclass(frozen=True)
 class TrayAnalysisResult:
-    original_rgb: np.ndarray
+    image_shape: tuple[int, int]
     overlay_rgb: np.ndarray
     counts_df: pd.DataFrame
     plant_summary_df: pd.DataFrame
@@ -255,7 +255,7 @@ def analyze_tray_image(
     counts_df = plant_summary_df[["Plant", "Position", "Estimated Leaves"]].copy()
 
     return TrayAnalysisResult(
-        original_rgb=image_rgb,
+        image_shape=tuple(int(v) for v in image_rgb.shape[:2]),
         overlay_rgb=cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB),
         counts_df=counts_df,
         plant_summary_df=plant_summary_df,
