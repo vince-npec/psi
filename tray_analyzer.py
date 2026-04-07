@@ -637,6 +637,109 @@ def _build_seedling_analysis_bbox(
     )
 
 
+def _seedling_root_corridor_geometry(
+    crop_shape: tuple[int, int],
+    anchor_local: tuple[int, int],
+    shoot_bbox_local: tuple[int, int, int, int],
+    *,
+    dark_background: bool,
+) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray, int, int]:
+    crop_h, crop_w = crop_shape
+    ax = int(np.clip(int(anchor_local[0]), 0, max(0, crop_w - 1)))
+    ay = int(np.clip(int(anchor_local[1]), 0, max(0, crop_h - 1)))
+    x0, _, x1, _ = shoot_bbox_local
+    shoot_width_px = max(1, int(x1 - x0))
+    if dark_background:
+        top_half_width_px = max(int(round(shoot_width_px * 0.72)), int(round(crop_w * 0.16)), 56)
+        bottom_half_width_px = max(int(round(crop_w * 0.03)), 8)
+    else:
+        top_half_width_px = max(int(round(shoot_width_px * 1.0)), int(round(crop_w * 0.28)), 72)
+        bottom_half_width_px = max(int(round(crop_w * 0.06)), 12)
+
+    corridor_start_y = max(0, ay - 8)
+    ys = np.arange(crop_h, dtype=np.float32)[:, None]
+    xs = np.arange(crop_w, dtype=np.float32)[None, :]
+    remaining_height_px = max(1.0, float(crop_h - corridor_start_y - 1))
+    down_fraction = np.clip((ys - float(corridor_start_y)) / remaining_height_px, 0.0, 1.0)
+    half_width_px = float(top_half_width_px) - ((float(top_half_width_px) - float(bottom_half_width_px)) * down_fraction)
+    tapered_corridor = (np.abs(xs - float(ax)) <= half_width_px) & (ys >= float(corridor_start_y))
+    return ax, ay, xs, ys, half_width_px.astype(np.float32), top_half_width_px, bottom_half_width_px
+
+
+def _seedling_has_dark_root_background(
+    crop_bgr: np.ndarray,
+    crop_shoot_mask_u8: np.ndarray,
+    crop_container_mask_u8: np.ndarray,
+    anchor_local: tuple[int, int],
+) -> bool:
+    if crop_bgr.size == 0:
+        return False
+
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    crop_h = crop_bgr.shape[0]
+    sample_mask = (crop_container_mask_u8 > 0) & (crop_shoot_mask_u8 == 0)
+    sample_mask[: max(0, min(crop_h, int(anchor_local[1]) - 6)), :] = False
+    if int(np.count_nonzero(sample_mask)) < 200:
+        sample_mask = (crop_container_mask_u8 > 0) & (crop_shoot_mask_u8 == 0)
+    if int(np.count_nonzero(sample_mask)) < 200:
+        return False
+
+    sat_values = hsv[:, :, 1][sample_mask]
+    val_values = hsv[:, :, 2][sample_mask]
+    median_sat = float(np.median(sat_values))
+    median_val = float(np.median(val_values))
+    bright_fraction = float(np.mean(val_values >= 150))
+    return median_sat < 55.0 and median_val < 135.0 and bright_fraction < 0.24
+
+
+def _compute_seedling_dark_root_score_map(
+    crop_bgr: np.ndarray,
+    crop_shoot_mask_u8: np.ndarray,
+    crop_container_mask_u8: np.ndarray,
+    anchor_local: tuple[int, int],
+    shoot_bbox_local: tuple[int, int, int, int],
+) -> np.ndarray:
+    if crop_bgr.size == 0:
+        return np.zeros(crop_bgr.shape[:2], dtype=np.float32)
+
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, None, 8, 7, 21)
+    blurred = cv2.GaussianBlur(denoised, (0, 0), 6)
+    contrast = cv2.subtract(denoised, blurred).astype(np.float32)
+    bright_tophat = cv2.morphologyEx(
+        denoised,
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+    ).astype(np.float32)
+    lab_b = lab[:, :, 2].astype(np.float32)
+    val = hsv[:, :, 2].astype(np.float32)
+    sat = hsv[:, :, 1].astype(np.float32)
+
+    ax, ay, xs, ys, half_width_px, _, _ = _seedling_root_corridor_geometry(
+        crop_bgr.shape[:2],
+        anchor_local,
+        shoot_bbox_local,
+        dark_background=True,
+    )
+    center_weight = 1.0 - np.clip(np.abs(xs - float(ax)) / np.maximum(half_width_px, 1.0), 0.0, 1.0)
+    tapered_corridor = (np.abs(xs - float(ax)) <= half_width_px) & (ys >= float(max(0, ay - 8)))
+    score_map = (
+        np.maximum(contrast - 4.0, 0.0) * 2.0
+        + np.maximum(bright_tophat - 5.0, 0.0) * 1.6
+        + np.maximum(val - 112.0, 0.0) * 0.8
+        + np.maximum(lab_b - 133.0, 0.0) * 0.8
+        - np.maximum(sat - 115.0, 0.0) * 0.35
+    )
+    score_map[(crop_shoot_mask_u8 > 0) | (crop_container_mask_u8 == 0) | (val < 78.0)] = 0.0
+    score_map[~tapered_corridor] = 0.0
+    score_map *= (0.58 + (0.42 * center_weight))
+    score_map = cv2.GaussianBlur(score_map.astype(np.float32), (0, 0), sigmaX=1.1, sigmaY=2.6)
+    score_map[score_map < 0.0] = 0.0
+    return score_map.astype(np.float32)
+
+
 def _segment_seedling_root_support_mask(
     crop_bgr: np.ndarray,
     crop_shoot_mask_u8: np.ndarray,
@@ -647,29 +750,74 @@ def _segment_seedling_root_support_mask(
     if crop_bgr.size == 0:
         return np.zeros(crop_bgr.shape[:2], dtype=np.uint8)
 
-    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    blurred = cv2.GaussianBlur(denoised, (0, 0), 7)
-    contrast = cv2.subtract(denoised, blurred)
+    dark_background = _seedling_has_dark_root_background(
+        crop_bgr,
+        crop_shoot_mask_u8,
+        crop_container_mask_u8,
+        anchor_local,
+    )
+    ax, ay, xs, ys, half_width_px, top_half_width_px, bottom_half_width_px = _seedling_root_corridor_geometry(
+        crop_bgr.shape[:2],
+        anchor_local,
+        shoot_bbox_local,
+        dark_background=dark_background,
+    )
 
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    candidate = ((contrast > 7) & (sat < 135) & (val > 35)).astype(np.uint8) * 255
-    candidate = cv2.bitwise_and(candidate, cv2.bitwise_not(crop_shoot_mask_u8))
-    candidate = cv2.bitwise_and(candidate, crop_container_mask_u8)
+    if dark_background:
+        score_map = _compute_seedling_dark_root_score_map(
+            crop_bgr,
+            crop_shoot_mask_u8,
+            crop_container_mask_u8,
+            anchor_local,
+            shoot_bbox_local,
+        )
+        positive_scores = score_map[score_map > 0]
+        if positive_scores.size == 0:
+            return np.zeros(crop_bgr.shape[:2], dtype=np.uint8)
+        primary_path = _trace_primary_root_path_from_score(score_map, anchor_local)
+        if not primary_path:
+            return np.zeros(crop_bgr.shape[:2], dtype=np.uint8)
+        lower_threshold = max(14.0, float(np.percentile(positive_scores, 68)))
+        candidate = ((score_map >= lower_threshold).astype(np.uint8) * 255)
+        primary_skeleton_mask_u8 = np.zeros_like(candidate)
+        for x_coord, y_coord in primary_path:
+            if 0 <= int(y_coord) < candidate.shape[0] and 0 <= int(x_coord) < candidate.shape[1]:
+                primary_skeleton_mask_u8[int(y_coord), int(x_coord)] = 255
+        primary_corridor_u8 = cv2.dilate(
+            primary_skeleton_mask_u8,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+            iterations=1,
+        )
+        upper_path_mask_u8 = np.zeros_like(candidate)
+        lateral_span_y = int(anchor_local[1]) + max(120, int(round(candidate.shape[0] * 0.18)))
+        for x_coord, y_coord in primary_path:
+            if int(y_coord) <= lateral_span_y and 0 <= int(y_coord) < candidate.shape[0] and 0 <= int(x_coord) < candidate.shape[1]:
+                upper_path_mask_u8[int(y_coord), int(x_coord)] = 255
+        lateral_seed_mask_u8 = upper_path_mask_u8 if np.any(upper_path_mask_u8 > 0) else primary_skeleton_mask_u8
+        lateral_corridor_u8 = cv2.dilate(
+            lateral_seed_mask_u8,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (47, 47)),
+            iterations=1,
+        )
+        candidate = cv2.bitwise_and(candidate, cv2.bitwise_or(primary_corridor_u8, lateral_corridor_u8))
+        candidate = cv2.bitwise_and(candidate, crop_container_mask_u8)
+        candidate = cv2.bitwise_and(candidate, cv2.bitwise_not(crop_shoot_mask_u8))
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8), iterations=1)
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8), iterations=1)
+        return candidate
+    else:
+        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        blurred = cv2.GaussianBlur(denoised, (0, 0), 7)
+        contrast = cv2.subtract(denoised, blurred)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+        candidate = ((contrast > 8) & (sat < 128) & (val > 40)).astype(np.uint8) * 255
+        candidate = cv2.bitwise_and(candidate, cv2.bitwise_not(crop_shoot_mask_u8))
+        candidate = cv2.bitwise_and(candidate, crop_container_mask_u8)
 
-    ax, ay = int(anchor_local[0]), int(anchor_local[1])
-    x0, _, x1, _ = shoot_bbox_local
-    crop_h, crop_w = candidate.shape[:2]
-    xs = np.arange(crop_w)[None, :]
-    ys = np.arange(crop_h)[:, None]
-    top_half_width_px = max(int(crop_w * 0.38), int((x1 - x0) * 1.1), 90)
-    bottom_half_width_px = max(int(crop_w * 0.08), 16)
-    row_fraction = np.clip(ys / max(1, crop_h - 1), 0.0, 1.0)
-    half_width_px = top_half_width_px - ((top_half_width_px - bottom_half_width_px) * row_fraction)
-    tapered_corridor = np.abs(xs - ax) <= half_width_px
-    candidate = ((candidate > 0) & tapered_corridor & (ys >= max(0, ay - 8))).astype(np.uint8) * 255
+    candidate = ((candidate > 0) & (np.abs(xs - float(ax)) <= half_width_px) & (ys >= float(max(0, ay - 8)))).astype(np.uint8) * 255
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8), iterations=1)
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((candidate > 0).astype(np.uint8), connectivity=8)
@@ -679,7 +827,7 @@ def _segment_seedling_root_support_mask(
     keep = np.zeros_like(candidate)
     anchor_disk = np.zeros_like(candidate)
     cv2.circle(anchor_disk, (ax, ay), 16, 255, -1)
-    max_component_area_px = max(2400, int(candidate.size * 0.012))
+    max_component_area_px = max(1800 if dark_background else 2400, int(candidate.size * (0.009 if dark_background else 0.012)))
 
     component_meta: list[dict[str, object]] = []
     for label_idx in range(1, num_labels):
@@ -720,7 +868,8 @@ def _segment_seedling_root_support_mask(
         return keep
 
     for _ in range(4):
-        dilated_keep = cv2.dilate(keep, np.ones((7, 7), dtype=np.uint8), iterations=1)
+        dilation_kernel = np.ones((5, 5), dtype=np.uint8) if dark_background else np.ones((7, 7), dtype=np.uint8)
+        dilated_keep = cv2.dilate(keep, dilation_kernel, iterations=1)
         changed = False
         for component in component_meta:
             component_mask = component["mask"]
@@ -730,8 +879,10 @@ def _segment_seedling_root_support_mask(
             bbox_width = int(component["bbox_width"])
             bbox_height = int(component["bbox_height"])
             center_y = float(component["center_y"])
+            center_row = int(np.clip(int(round(center_y)), 0, max(0, candidate.shape[0] - 1)))
+            half_width_at_row_px = float(half_width_px[center_row, 0])
             allowed_center_drift_px = float(
-                max(bottom_half_width_px * 2, top_half_width_px - ((top_half_width_px - bottom_half_width_px) * min(1.0, center_y / max(1, crop_h - 1))))
+                max(bottom_half_width_px * 2, half_width_at_row_px * (1.15 if dark_background else 1.35))
             )
             if area_px > max_component_area_px:
                 continue
@@ -739,7 +890,7 @@ def _segment_seedling_root_support_mask(
                 continue
             if bbox_height < 4:
                 continue
-            if bbox_width > max(90, int(crop_w * 0.22)) and bbox_height < bbox_width:
+            if bbox_width > max(72 if dark_background else 90, int(candidate.shape[1] * (0.14 if dark_background else 0.22))) and bbox_height < bbox_width:
                 continue
             if np.any(dilated_keep[component_mask] > 0):
                 keep[component_mask] = 255
@@ -749,6 +900,8 @@ def _segment_seedling_root_support_mask(
 
     keep = cv2.bitwise_and(keep, crop_container_mask_u8)
     keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    if dark_background:
+        keep = cv2.morphologyEx(keep, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8), iterations=1)
     return keep
 
 
@@ -761,6 +914,21 @@ def _compute_seedling_primary_root_score_map(
 ) -> np.ndarray:
     if crop_bgr.size == 0:
         return np.zeros(crop_bgr.shape[:2], dtype=np.float32)
+
+    dark_background = _seedling_has_dark_root_background(
+        crop_bgr,
+        crop_shoot_mask_u8,
+        crop_container_mask_u8,
+        anchor_local,
+    )
+    if dark_background:
+        return _compute_seedling_dark_root_score_map(
+            crop_bgr,
+            crop_shoot_mask_u8,
+            crop_container_mask_u8,
+            anchor_local,
+            shoot_bbox_local,
+        )
 
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
@@ -788,16 +956,13 @@ def _compute_seedling_primary_root_score_map(
     val = hsv[:, :, 2]
     score_map[(crop_shoot_mask_u8 > 0) | (crop_container_mask_u8 == 0) | (val <= 30)] = 0.0
 
-    ax, ay = int(anchor_local[0]), int(anchor_local[1])
-    x0, _, x1, _ = shoot_bbox_local
-    crop_h, crop_w = score_map.shape[:2]
-    xs = np.arange(crop_w)[None, :]
-    ys = np.arange(crop_h)[:, None]
-    top_half_width_px = max(int(crop_w * 0.38), int((x1 - x0) * 1.1), 90)
-    bottom_half_width_px = max(int(crop_w * 0.08), 16)
-    row_fraction = np.clip(ys / max(1, crop_h - 1), 0.0, 1.0)
-    half_width_px = top_half_width_px - ((top_half_width_px - bottom_half_width_px) * row_fraction)
-    tapered_corridor = (np.abs(xs - ax) <= half_width_px) & (ys >= max(0, ay - 8))
+    ax, ay, xs, ys, half_width_px, _, _ = _seedling_root_corridor_geometry(
+        crop_bgr.shape[:2],
+        anchor_local,
+        shoot_bbox_local,
+        dark_background=False,
+    )
+    tapered_corridor = (np.abs(xs - float(ax)) <= half_width_px) & (ys >= float(max(0, ay - 8)))
     score_map[~tapered_corridor] = 0.0
     return score_map
 
@@ -835,9 +1000,17 @@ def _classify_seedling_root_parts(
     )
     skeleton_primary_path = _trace_primary_root_path(connected_skeleton_mask_u8, start_xy) if start_xy is not None else []
     score_primary_path = _trace_primary_root_path_from_score(primary_root_score_map, anchor_local)
+    if score_primary_path:
+        anchor_x = int(anchor_local[0])
+        endpoint_deviation_px = abs(int(score_primary_path[-1][0]) - anchor_x)
+        mean_lateral_deviation_px = float(
+            np.mean([abs(int(x_coord) - anchor_x) for x_coord, _ in score_primary_path])
+        )
+        if endpoint_deviation_px > max(56, int(round(root_support_mask_u8.shape[1] * 0.16))) or mean_lateral_deviation_px > max(34.0, float(root_support_mask_u8.shape[1] * 0.18)):
+            score_primary_path = []
     primary_path = (
         score_primary_path
-        if _polyline_length_px(score_primary_path) > _polyline_length_px(skeleton_primary_path)
+        if _polyline_length_px(score_primary_path) > (_polyline_length_px(skeleton_primary_path) * 1.05)
         else skeleton_primary_path
     )
     primary_skeleton_mask_u8 = np.zeros_like(support_mask_u8)
@@ -856,16 +1029,21 @@ def _classify_seedling_root_parts(
     total_skeleton_mask_u8 = cv2.bitwise_or(primary_skeleton_mask_u8, lateral_skeleton_mask_u8)
 
     primary_support_mask_u8 = _binary_root_mask_from_score_map(primary_root_score_map)
+    if not np.any(primary_support_mask_u8 > 0):
+        primary_support_mask_u8 = support_mask_u8.copy()
     primary_root_mask_u8 = _refine_root_mask_from_skeleton(
         primary_support_mask_u8,
         primary_skeleton_mask_u8,
         radius_px=6,
     )
-    root_mask_u8 = cv2.bitwise_or(support_mask_u8, primary_root_mask_u8)
-    lateral_root_mask_u8 = cv2.bitwise_and(root_mask_u8, cv2.bitwise_not(primary_root_mask_u8))
-    if np.any(lateral_skeleton_mask_u8 > 0) and not np.any(lateral_root_mask_u8 > 0):
-        lateral_root_mask_u8 = _refine_root_mask_from_skeleton(support_mask_u8, lateral_skeleton_mask_u8, radius_px=3)
-        root_mask_u8 = cv2.bitwise_or(primary_root_mask_u8, lateral_root_mask_u8)
+    lateral_root_mask_u8 = (
+        _refine_root_mask_from_skeleton(support_mask_u8, lateral_skeleton_mask_u8, radius_px=3)
+        if np.any(lateral_skeleton_mask_u8 > 0)
+        else np.zeros_like(support_mask_u8)
+    )
+    root_mask_u8 = cv2.bitwise_or(primary_root_mask_u8, lateral_root_mask_u8)
+    if not np.any(root_mask_u8 > 0):
+        root_mask_u8 = support_mask_u8.copy()
 
     primary_root_length_px = _polyline_length_px(primary_path)
     total_root_length_px = primary_root_length_px + lateral_root_length_px
@@ -1098,10 +1276,10 @@ def _binary_root_mask_from_score_map(score_map: np.ndarray | None) -> np.ndarray
         return np.zeros((0, 0), dtype=np.uint8)
     if not np.any(score_map > 0):
         return np.zeros(score_map.shape[:2], dtype=np.uint8)
-    threshold = max(14.0, float(np.percentile(score_map[score_map > 0], 90)))
+    threshold = max(18.0, float(np.percentile(score_map[score_map > 0], 93)))
     binary_mask_u8 = ((score_map >= threshold).astype(np.uint8) * 255)
     binary_mask_u8 = cv2.morphologyEx(binary_mask_u8, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8), iterations=1)
-    binary_mask_u8 = cv2.morphologyEx(binary_mask_u8, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    binary_mask_u8 = cv2.morphologyEx(binary_mask_u8, cv2.MORPH_CLOSE, np.ones((2, 2), dtype=np.uint8), iterations=1)
     return binary_mask_u8
 
 
@@ -2353,8 +2531,9 @@ def _draw_region_overlay(image_bgr: np.ndarray, plant_result: PlantLeafResult, c
     cv2.circle(image_bgr, (site_center_x, site_center_y), 6, color, -1)
 
     if np.any(mask > 0):
-        caption_x = max(12, x0 + 12)
-        caption_y = max(28, y0 + 28)
+        mask_ys, mask_xs = np.where(mask > 0)
+        caption_x = max(12, x0 + int(mask_xs.min()) + 12)
+        caption_y = max(28, y0 + int(mask_ys.min()) + 28)
     else:
         caption_x = max(12, site_center_x - 58)
         caption_y = max(28, site_center_y - 14)

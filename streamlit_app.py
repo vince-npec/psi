@@ -838,6 +838,132 @@ def _extract_seedling_x_regions(
     return regions, center_ratios
 
 
+def _extract_seedling_component_regions(
+    mask_u8: np.ndarray,
+    expected_seedling_count: int,
+    y_min: int | None = None,
+    y_max: int | None = None,
+    initial_centers: np.ndarray | None = None,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    if mask_u8.size == 0 or expected_seedling_count <= 0:
+        return [], np.zeros(0, dtype=np.float32)
+
+    filtered_mask = mask_u8.copy()
+    height, width = filtered_mask.shape[:2]
+    if y_min is not None and y_min > 0:
+        filtered_mask[: max(0, min(height, int(y_min))), :] = 0
+    if y_max is not None and y_max < height - 1:
+        filtered_mask[max(0, min(height, int(y_max) + 1)) :, :] = 0
+
+    binary = (filtered_mask > 0).astype(np.uint8)
+    total_area_px = int(np.count_nonzero(binary))
+    if total_area_px <= 0:
+        return [], np.zeros(expected_seedling_count, dtype=np.float32)
+
+    min_component_area_px = max(600, int(total_area_px / max(1, expected_seedling_count * 12)))
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    components: list[dict[str, Any]] = []
+    for label_idx in range(1, num_labels):
+        area_px = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area_px < min_component_area_px:
+            continue
+        x0 = int(stats[label_idx, cv2.CC_STAT_LEFT])
+        y0 = int(stats[label_idx, cv2.CC_STAT_TOP])
+        width_px = int(stats[label_idx, cv2.CC_STAT_WIDTH])
+        height_px = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+        if width_px < 24 or height_px < 24:
+            continue
+        component_mask = (labels == label_idx)
+        ys, xs = np.where(component_mask)
+        if xs.size == 0 or ys.size == 0:
+            continue
+        anchor_band = xs[ys >= (ys.max() - 4)]
+        anchor_x = int(np.median(anchor_band)) if anchor_band.size > 0 else int(round(float(centroids[label_idx, 0])))
+        anchor_y = int(ys.max())
+        mask_component_u8 = (component_mask.astype(np.uint8) * 255)
+        components.append(
+            {
+                "bbox": (x0, y0, x0 + width_px, y0 + height_px),
+                "mask_u8": mask_component_u8,
+                "anchor": (anchor_x, anchor_y),
+                "center_x": float(xs.mean()),
+                "center_y": float(ys.mean()),
+                "area_px": area_px,
+            }
+        )
+
+    if not components:
+        return [], np.zeros(expected_seedling_count, dtype=np.float32)
+
+    if initial_centers is not None and len(initial_centers) == expected_seedling_count and len(components) >= expected_seedling_count:
+        remaining = components.copy()
+        selected: list[dict[str, Any]] = []
+        for target_x in np.sort(initial_centers.astype(np.float32)):
+            best_idx = min(
+                range(len(remaining)),
+                key=lambda idx: (
+                    abs(float(remaining[idx]["center_x"]) - float(target_x)),
+                    -int(remaining[idx]["area_px"]),
+                ),
+            )
+            selected.append(remaining.pop(best_idx))
+            if not remaining:
+                break
+        components = selected
+
+    if len(components) != expected_seedling_count:
+        return [], np.zeros(expected_seedling_count, dtype=np.float32)
+
+    components.sort(key=lambda item: float(item["center_x"]))
+    regions: list[dict[str, Any]] = []
+    for component_idx, component in enumerate(components):
+        component["site_index"] = int(component_idx + 1)
+        component["row_index"] = 0
+        component["col_index"] = int(component_idx)
+        component["name"] = f"Seedling {component_idx + 1}"
+        component["position"] = tray_analyzer._format_grid_position(0, component_idx, 1, expected_seedling_count)
+        regions.append(component)
+
+    center_ratios = (
+        np.asarray([float(component["center_x"]) for component in regions], dtype=np.float32) / float(max(1, width))
+    ).astype(np.float32)
+    return regions, center_ratios
+
+
+def _segment_linked_seedling_side_shoot_mask(image_bgr: np.ndarray) -> np.ndarray:
+    if image_bgr.size == 0:
+        return np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
+    exg = (2 * rgb[:, :, 1]) - rgb[:, :, 0] - rgb[:, :, 2]
+    hsv_mask = cv2.inRange(
+        hsv,
+        np.array([28, 60, 55], dtype=np.uint8),
+        np.array([90, 255, 255], dtype=np.uint8),
+    )
+    exg_mask = ((exg > 22).astype(np.uint8) * 255)
+    mask = cv2.bitwise_and(hsv_mask, exg_mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8), iterations=1)
+
+    binary = (mask > 0).astype(np.uint8)
+    total_area_px = int(np.count_nonzero(binary))
+    if total_area_px <= 0:
+        return np.zeros_like(mask)
+    min_component_area_px = max(700, int(total_area_px * 0.035))
+    filtered_mask = np.zeros_like(mask)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    for label_idx in range(1, num_labels):
+        area_px = int(stats[label_idx, cv2.CC_STAT_AREA])
+        width_px = int(stats[label_idx, cv2.CC_STAT_WIDTH])
+        height_px = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+        if area_px < min_component_area_px or width_px < 50 or height_px < 60:
+            continue
+        filtered_mask[labels == label_idx] = 255
+    return filtered_mask
+
+
 @st.cache_data(show_spinner=False, max_entries=24)
 def _analyze_linked_seedling_top_view(
     image_bytes: bytes,
@@ -847,10 +973,15 @@ def _analyze_linked_seedling_top_view(
     image_rgb = np.array(_open_rgb_image(image_bytes))
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     shoot_mask_u8 = tray_analyzer._segment_seedling_shoot_mask(image_bgr)
-    regions, center_ratios = _extract_seedling_x_regions(
+    regions, center_ratios = _extract_seedling_component_regions(
         shoot_mask_u8,
         expected_seedling_count=expected_seedling_count,
     )
+    if len(regions) != expected_seedling_count:
+        regions, center_ratios = _extract_seedling_x_regions(
+            shoot_mask_u8,
+            expected_seedling_count=expected_seedling_count,
+        )
     pixels_per_cm, mm_per_pixel, scale_source = _resolve_manual_scale_calibration(pixels_per_cm_override)
     tray_profile = tray_analyzer.TrayProfile(
         key="seedling_top_linked",
@@ -873,7 +1004,10 @@ def _analyze_linked_seedling_top_view(
         crop_x1 = min(image_bgr.shape[1], x1 + pad_x)
         crop_y1 = min(image_bgr.shape[0], y1 + pad_y)
         crop_bgr = image_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
-        crop_mask_u8 = region["mask_u8"][crop_y0:crop_y1, crop_x0:crop_x1].copy()
+        if "mask_u8" in region:
+            crop_mask_u8 = region["mask_u8"][crop_y0:crop_y1, crop_x0:crop_x1].copy()
+        else:
+            crop_mask_u8 = shoot_mask_u8[crop_y0:crop_y1, crop_x0:crop_x1].copy()
 
         leaf_label_map, leaf_count, canopy_area_px, min_leaf_area_px = tray_analyzer._estimate_leaf_instances(
             crop_mask_u8,
@@ -986,18 +1120,26 @@ def _analyze_linked_seedling_side_view(
 ) -> dict[str, Any]:
     image_rgb = np.array(_open_rgb_image(image_bytes))
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    shoot_mask_u8 = tray_analyzer._segment_seedling_shoot_mask(image_bgr)
+    shoot_mask_u8 = _segment_linked_seedling_side_shoot_mask(image_bgr)
     surface_y = _detect_side_view_surface_y(image_bgr)
     expected_centers = None
     if initial_center_ratios and len(initial_center_ratios) == expected_seedling_count:
         expected_centers = np.asarray(initial_center_ratios, dtype=np.float32) * float(image_bgr.shape[1])
-    regions, center_ratios = _extract_seedling_x_regions(
+    regions, center_ratios = _extract_seedling_component_regions(
         shoot_mask_u8,
         expected_seedling_count=expected_seedling_count,
         y_min=int(surface_y * 0.7),
         y_max=min(image_bgr.shape[0] - 1, surface_y + max(40, int(round(image_bgr.shape[0] * 0.03)))),
         initial_centers=expected_centers,
     )
+    if len(regions) != expected_seedling_count:
+        regions, center_ratios = _extract_seedling_x_regions(
+            shoot_mask_u8,
+            expected_seedling_count=expected_seedling_count,
+            y_min=int(surface_y * 0.7),
+            y_max=min(image_bgr.shape[0] - 1, surface_y + max(40, int(round(image_bgr.shape[0] * 0.03)))),
+            initial_centers=expected_centers,
+        )
     pixels_per_cm, mm_per_pixel, scale_source = _resolve_manual_scale_calibration(pixels_per_cm_override)
 
     overlay_bgr = image_bgr.copy()
@@ -1017,7 +1159,7 @@ def _analyze_linked_seedling_side_view(
         if xs.size == 0 or ys.size == 0:
             continue
 
-        top_y = int(round(float(np.quantile(ys, 0.03))))
+        top_y = int(region["bbox"][1])
         x0, _, x1, _ = region["bbox"]
         visible_height_px = max(0.0, float(surface_y - top_y))
         visible_width_px = float(max(0, x1 - x0))
