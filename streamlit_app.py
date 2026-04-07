@@ -12,6 +12,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
+try:
+    import onnxruntime as ort
+except Exception:  # pragma: no cover - optional dependency in local dev
+    ort = None
 
 try:
     from . import tray_analyzer
@@ -48,12 +52,237 @@ APP_ROOT = Path(__file__).resolve().parent
 LOGO_PATH = APP_ROOT / "assets" / "NPEC-logo-black.png"
 FOOTER_TEXT = "© 2026 NPEC Innovation - Visualization Dashboard by Dr. Vinicius Lube | Phenomics Engineer Innovation Lead"
 ZIP_IMAGE_TYPES = sorted(ext.lstrip(".") for ext in SUPPORTED_IMAGE_EXTENSIONS)
+TOP_VIEW_ONNX_MODEL_PATH = APP_ROOT / "models" / "rgb2_only_hailo_rosette_v1.onnx"
+TOP_VIEW_ONNX_CONFIDENCE = 0.25
+TOP_VIEW_ONNX_IOU = 0.45
+TOP_VIEW_ONNX_MASK_THRESHOLD = 0.45
 
 
 def _open_rgb_image(image_bytes: bytes) -> Image.Image:
     image = Image.open(io.BytesIO(image_bytes))
     image.load()
     return image.convert("RGB")
+
+
+@st.cache_resource(show_spinner=False)
+def _load_top_view_onnx_model() -> dict[str, Any] | None:
+    if ort is None or not TOP_VIEW_ONNX_MODEL_PATH.exists():
+        return None
+
+    session = ort.InferenceSession(
+        str(TOP_VIEW_ONNX_MODEL_PATH),
+        providers=["CPUExecutionProvider"],
+    )
+    input_meta = session.get_inputs()[0]
+    input_shape = list(input_meta.shape)
+    input_h = int(input_shape[2]) if len(input_shape) >= 4 and isinstance(input_shape[2], int) and input_shape[2] > 0 else 640
+    input_w = int(input_shape[3]) if len(input_shape) >= 4 and isinstance(input_shape[3], int) and input_shape[3] > 0 else 640
+    return {
+        "session": session,
+        "input_name": input_meta.name,
+        "input_h": input_h,
+        "input_w": input_w,
+    }
+
+
+def _letterbox_image(image_bgr: np.ndarray, new_shape: tuple[int, int]) -> tuple[np.ndarray, float, tuple[float, float], tuple[int, int]]:
+    image_h, image_w = image_bgr.shape[:2]
+    target_h, target_w = int(new_shape[0]), int(new_shape[1])
+    scale = min(float(target_h) / float(max(1, image_h)), float(target_w) / float(max(1, image_w)))
+    resized_w = max(1, int(round(float(image_w) * scale)))
+    resized_h = max(1, int(round(float(image_h) * scale)))
+    resized = cv2.resize(image_bgr, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+    pad_w = float(target_w - resized_w)
+    pad_h = float(target_h - resized_h)
+    pad_left = int(round((pad_w / 2.0) - 0.1))
+    pad_top = int(round((pad_h / 2.0) - 0.1))
+    pad_right = max(0, target_w - resized_w - pad_left)
+    pad_bottom = max(0, target_h - resized_h - pad_top)
+    padded = cv2.copyMakeBorder(
+        resized,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        cv2.BORDER_CONSTANT,
+        value=(114, 114, 114),
+    )
+    return padded, float(scale), (pad_w / 2.0, pad_h / 2.0), (resized_h, resized_w)
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -50.0, 50.0)))
+
+
+def _nms_xyxy(boxes_xyxy: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
+    if boxes_xyxy.size == 0 or scores.size == 0:
+        return []
+
+    order = np.argsort(scores)[::-1]
+    keep: list[int] = []
+    while order.size > 0:
+        current = int(order[0])
+        keep.append(current)
+        if order.size == 1:
+            break
+        remaining = order[1:]
+        xx1 = np.maximum(boxes_xyxy[current, 0], boxes_xyxy[remaining, 0])
+        yy1 = np.maximum(boxes_xyxy[current, 1], boxes_xyxy[remaining, 1])
+        xx2 = np.minimum(boxes_xyxy[current, 2], boxes_xyxy[remaining, 2])
+        yy2 = np.minimum(boxes_xyxy[current, 3], boxes_xyxy[remaining, 3])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        area_current = np.maximum(1.0, boxes_xyxy[current, 2] - boxes_xyxy[current, 0]) * np.maximum(1.0, boxes_xyxy[current, 3] - boxes_xyxy[current, 1])
+        area_remaining = np.maximum(1.0, boxes_xyxy[remaining, 2] - boxes_xyxy[remaining, 0]) * np.maximum(1.0, boxes_xyxy[remaining, 3] - boxes_xyxy[remaining, 1])
+        iou = inter / (area_current + area_remaining - inter + 1e-6)
+        order = remaining[iou <= float(iou_threshold)]
+    return keep
+
+
+def _crop_mask_to_box(mask_prob: np.ndarray, box_xyxy: np.ndarray) -> np.ndarray:
+    mask_h, mask_w = mask_prob.shape[:2]
+    x1 = int(np.floor(box_xyxy[0]))
+    y1 = int(np.floor(box_xyxy[1]))
+    x2 = int(np.ceil(box_xyxy[2]))
+    y2 = int(np.ceil(box_xyxy[3]))
+    x1 = max(0, min(mask_w, x1))
+    y1 = max(0, min(mask_h, y1))
+    x2 = max(0, min(mask_w, x2))
+    y2 = max(0, min(mask_h, y2))
+    cropped = np.zeros_like(mask_prob, dtype=np.float32)
+    if x2 > x1 and y2 > y1:
+        cropped[y1:y2, x1:x2] = mask_prob[y1:y2, x1:x2]
+    return cropped
+
+
+def _infer_top_view_seedling_regions_from_onnx(
+    image_bgr: np.ndarray,
+    expected_seedling_count: int,
+) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
+    model = _load_top_view_onnx_model()
+    if model is None or image_bgr.size == 0 or expected_seedling_count <= 0:
+        return [], np.zeros(0, dtype=np.float32), np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    input_h = int(model["input_h"])
+    input_w = int(model["input_w"])
+    letterboxed_bgr, scale, (dw, dh), (resized_h, resized_w) = _letterbox_image(image_bgr, (input_h, input_w))
+    input_tensor = cv2.cvtColor(letterboxed_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    input_tensor = np.transpose(input_tensor, (2, 0, 1))[None]
+
+    output0, output1 = model["session"].run(None, {model["input_name"]: input_tensor})
+    pred = output0[0].transpose(1, 0)
+    proto = output1[0]
+    if pred.size == 0 or proto.size == 0:
+        return [], np.zeros(0, dtype=np.float32), np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    mask_dim = int(proto.shape[0])
+    class_count = int(pred.shape[1] - 4 - mask_dim)
+    if class_count <= 0:
+        return [], np.zeros(0, dtype=np.float32), np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    class_scores = pred[:, 4 : 4 + class_count]
+    best_scores = class_scores.max(axis=1)
+    best_class_ids = class_scores.argmax(axis=1)
+    valid = best_scores >= float(TOP_VIEW_ONNX_CONFIDENCE)
+    if int(np.count_nonzero(valid)) == 0:
+        return [], np.zeros(0, dtype=np.float32), np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    pred = pred[valid]
+    best_scores = best_scores[valid]
+    best_class_ids = best_class_ids[valid]
+    mask_coeffs = pred[:, 4 + class_count :]
+    boxes_xywh = pred[:, :4].astype(np.float32)
+    boxes_xyxy = np.zeros_like(boxes_xywh, dtype=np.float32)
+    boxes_xyxy[:, 0] = boxes_xywh[:, 0] - (boxes_xywh[:, 2] / 2.0)
+    boxes_xyxy[:, 1] = boxes_xywh[:, 1] - (boxes_xywh[:, 3] / 2.0)
+    boxes_xyxy[:, 2] = boxes_xywh[:, 0] + (boxes_xywh[:, 2] / 2.0)
+    boxes_xyxy[:, 3] = boxes_xywh[:, 1] + (boxes_xywh[:, 3] / 2.0)
+    keep_indices = _nms_xyxy(boxes_xyxy, best_scores.astype(np.float32), TOP_VIEW_ONNX_IOU)
+    if not keep_indices:
+        return [], np.zeros(0, dtype=np.float32), np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    keep_indices = sorted(keep_indices, key=lambda idx: float(best_scores[idx]), reverse=True)
+    selected_indices = [idx for idx in keep_indices if int(best_class_ids[idx]) == 0][: max(1, expected_seedling_count)]
+    if len(selected_indices) < expected_seedling_count:
+        return [], np.zeros(0, dtype=np.float32), np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    proto_h, proto_w = int(proto.shape[1]), int(proto.shape[2])
+    proto_flat = proto.reshape(mask_dim, -1)
+    heuristic_green_mask_u8 = tray_analyzer._segment_seedling_shoot_mask(image_bgr)
+    heuristic_green_mask_u8 = cv2.dilate(heuristic_green_mask_u8, np.ones((11, 11), dtype=np.uint8), iterations=1)
+    hsv_full = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    blue_marker_mask_u8 = cv2.inRange(
+        hsv_full,
+        np.array([85, 60, 40], dtype=np.uint8),
+        np.array([140, 255, 255], dtype=np.uint8),
+    )
+
+    image_h, image_w = image_bgr.shape[:2]
+    union_mask_u8 = np.zeros((image_h, image_w), dtype=np.uint8)
+    regions: list[dict[str, Any]] = []
+    for det_idx, selected_idx in enumerate(selected_indices):
+        coeff = mask_coeffs[selected_idx].astype(np.float32)
+        mask_prob = _sigmoid(np.dot(coeff, proto_flat).reshape(proto_h, proto_w))
+        box = boxes_xyxy[selected_idx].astype(np.float32)
+        box_proto = np.array(
+            [
+                box[0] * float(proto_w) / float(input_w),
+                box[1] * float(proto_h) / float(input_h),
+                box[2] * float(proto_w) / float(input_w),
+                box[3] * float(proto_h) / float(input_h),
+            ],
+            dtype=np.float32,
+        )
+        mask_prob = _crop_mask_to_box(mask_prob, box_proto)
+        mask_input = cv2.resize(mask_prob, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
+        pad_left = int(round(dw - 0.1))
+        pad_top = int(round(dh - 0.1))
+        unpadded = mask_input[pad_top : pad_top + resized_h, pad_left : pad_left + resized_w]
+        if unpadded.size == 0:
+            continue
+        mask_orig = cv2.resize(unpadded, (image_w, image_h), interpolation=cv2.INTER_LINEAR)
+        model_mask_u8 = ((mask_orig >= float(TOP_VIEW_ONNX_MASK_THRESHOLD)).astype(np.uint8) * 255)
+        model_mask_u8 = cv2.bitwise_and(model_mask_u8, cv2.bitwise_not(blue_marker_mask_u8))
+        refined_mask_u8 = cv2.bitwise_and(model_mask_u8, heuristic_green_mask_u8)
+        if int(np.count_nonzero(refined_mask_u8)) < max(180, int(np.count_nonzero(model_mask_u8) * 0.22)):
+            refined_mask_u8 = model_mask_u8
+        refined_mask_u8 = cv2.morphologyEx(refined_mask_u8, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8), iterations=1)
+        refined_mask_u8 = cv2.morphologyEx(refined_mask_u8, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8), iterations=1)
+        ys, xs = np.where(refined_mask_u8 > 0)
+        if xs.size == 0 or ys.size == 0:
+            continue
+        x0 = int(xs.min())
+        y0 = int(ys.min())
+        x1 = int(xs.max()) + 1
+        y1 = int(ys.max()) + 1
+        anchor_band = xs[ys >= (ys.max() - 4)]
+        anchor_x = int(np.median(anchor_band)) if anchor_band.size > 0 else int(round(float(xs.mean())))
+        anchor_y = int(ys.max())
+        union_mask_u8 = cv2.bitwise_or(union_mask_u8, refined_mask_u8)
+        regions.append(
+            {
+                "bbox": (x0, y0, x1, y1),
+                "mask_u8": refined_mask_u8,
+                "anchor": (anchor_x, anchor_y),
+                "center_x": float(xs.mean()),
+                "center_y": float(ys.mean()),
+                "area_px": int(np.count_nonzero(refined_mask_u8)),
+            }
+        )
+
+    if len(regions) != expected_seedling_count:
+        return [], np.zeros(0, dtype=np.float32), np.zeros((image_h, image_w), dtype=np.uint8)
+
+    regions.sort(key=lambda item: float(item["center_x"]))
+    for region_idx, region in enumerate(regions):
+        region["site_index"] = int(region_idx + 1)
+        region["row_index"] = 0
+        region["col_index"] = int(region_idx)
+        region["name"] = f"Seedling {region_idx + 1}"
+        region["position"] = tray_analyzer._format_grid_position(0, region_idx, 1, expected_seedling_count)
+    center_ratios = (
+        np.asarray([float(region["center_x"]) for region in regions], dtype=np.float32) / float(max(1, image_w))
+    ).astype(np.float32)
+    return regions, center_ratios, union_mask_u8
 
 
 @st.cache_data(show_spinner=False, max_entries=12)
@@ -972,11 +1201,16 @@ def _analyze_linked_seedling_top_view(
 ) -> dict[str, Any]:
     image_rgb = np.array(_open_rgb_image(image_bytes))
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    shoot_mask_u8 = tray_analyzer._segment_seedling_shoot_mask(image_bgr)
-    regions, center_ratios = _extract_seedling_component_regions(
-        shoot_mask_u8,
+    regions, center_ratios, shoot_mask_u8 = _infer_top_view_seedling_regions_from_onnx(
+        image_bgr,
         expected_seedling_count=expected_seedling_count,
     )
+    if len(regions) != expected_seedling_count:
+        shoot_mask_u8 = tray_analyzer._segment_seedling_shoot_mask(image_bgr)
+        regions, center_ratios = _extract_seedling_component_regions(
+            shoot_mask_u8,
+            expected_seedling_count=expected_seedling_count,
+        )
     if len(regions) != expected_seedling_count:
         regions, center_ratios = _extract_seedling_x_regions(
             shoot_mask_u8,
