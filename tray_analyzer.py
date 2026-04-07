@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from math import pi
+from math import hypot, pi
 
 import cv2
 import numpy as np
@@ -24,10 +25,13 @@ AUTO_TRAY_PROFILE_KEY = "auto"
 GRID_2X2_PROFILE_KEY = "grid_2x2"
 GRID_4X5_PROFILE_KEY = "grid_4x5"
 CUSTOM_TRAY_PROFILE_KEY = "custom"
+SEEDLINGS_PROFILE_KEY = "seedlings"
 CONTAINER_MODE_AUTO = "auto"
 CONTAINER_MODE_RECTANGLE = "rectangle"
 CONTAINER_MODE_CIRCLE = "circle"
 CONTAINER_MODE_FULL_IMAGE = "full_image"
+ANALYSIS_KIND_FOLIAGE = "foliage"
+ANALYSIS_KIND_SEEDLINGS = "seedlings"
 TRAY_LONG_SIDE_CM = 33.0
 MAX_TRAY_ANALYSIS_DIM = 1400
 MAX_PLANT_ANALYSIS_DIM = 3000
@@ -88,12 +92,18 @@ class PlantLeafResult:
     leaf_label_map: np.ndarray
     plant_traits: dict[str, object]
     leaf_traits: list[dict[str, object]]
+    shoot_mask: np.ndarray | None = None
+    root_mask: np.ndarray | None = None
+    primary_root_mask: np.ndarray | None = None
+    lateral_root_mask: np.ndarray | None = None
+    root_skeleton_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
 class TrayAnalysisResult:
     image_shape: tuple[int, int]
     overlay_rgb: np.ndarray
+    analysis_kind: str
     counts_df: pd.DataFrame
     plant_summary_df: pd.DataFrame
     leaf_detail_df: pd.DataFrame
@@ -121,6 +131,7 @@ def get_tray_profile_options() -> list[tuple[str, str]]:
         (AUTO_TRAY_PROFILE_KEY, "Auto (2x2 or 4x5)"),
         (GRID_2X2_PROFILE_KEY, TRAY_PROFILES[GRID_2X2_PROFILE_KEY].name),
         (GRID_4X5_PROFILE_KEY, TRAY_PROFILES[GRID_4X5_PROFILE_KEY].name),
+        (SEEDLINGS_PROFILE_KEY, "Seedlings (roots + shoots)"),
         (CUSTOM_TRAY_PROFILE_KEY, "Universal / Custom Grid"),
     ]
 
@@ -155,6 +166,18 @@ def analyze_tray_image(
     circle_center_x_shift_ratio = _clip_ratio(circle_center_x_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_center_y_shift_ratio = _clip_ratio(circle_center_y_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_radius_scale = _clip_ratio(circle_radius_scale, 1.0, minimum=0.2, maximum=3.0)
+    if tray_profile_key == SEEDLINGS_PROFILE_KEY:
+        return _analyze_seedling_image(
+            image_rgb=image_rgb,
+            image_bgr=image_bgr,
+            tray_long_side_cm=tray_long_side_cm,
+            pixels_per_cm_override=pixels_per_cm_override,
+            container_mode=container_mode,
+            circular_container_inset_ratio=circular_container_inset_ratio,
+            circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+            circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+            circle_radius_scale=circle_radius_scale,
+        )
     tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
         image_bgr,
         container_mode=container_mode,
@@ -257,6 +280,7 @@ def analyze_tray_image(
     return TrayAnalysisResult(
         image_shape=tuple(int(v) for v in image_rgb.shape[:2]),
         overlay_rgb=cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB),
+        analysis_kind=ANALYSIS_KIND_FOLIAGE,
         counts_df=counts_df,
         plant_summary_df=plant_summary_df,
         leaf_detail_df=leaf_detail_df,
@@ -280,7 +304,893 @@ def analyze_tray_image(
     )
 
 
+def _analyze_seedling_image(
+    image_rgb: np.ndarray,
+    image_bgr: np.ndarray,
+    tray_long_side_cm: float,
+    pixels_per_cm_override: float | None,
+    container_mode: str,
+    circular_container_inset_ratio: float,
+    circle_center_x_shift_ratio: float,
+    circle_center_y_shift_ratio: float,
+    circle_radius_scale: float,
+) -> TrayAnalysisResult:
+    tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
+        image_bgr,
+        container_mode=container_mode,
+        circular_container_inset_ratio=circular_container_inset_ratio,
+        circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+        circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+        circle_radius_scale=circle_radius_scale,
+    )
+    pixels_per_cm_override = _normalize_optional_positive_float(pixels_per_cm_override)
+    pixels_per_cm, mm_per_pixel, scale_source = _resolve_scale_calibration(
+        tray_long_side_px=tray_long_side_px,
+        tray_long_side_cm=tray_long_side_cm,
+        pixels_per_cm_override=pixels_per_cm_override,
+    )
+
+    global_shoot_mask_u8 = _segment_seedling_shoot_mask(image_bgr)
+    global_shoot_mask_u8 = cv2.bitwise_and(global_shoot_mask_u8, container_mask_u8)
+    seedling_regions, grid_rows, grid_cols = _detect_seedling_regions(global_shoot_mask_u8)
+    seedling_profile = TrayProfile(
+        key=SEEDLINGS_PROFILE_KEY,
+        name="Seedlings",
+        rows=max(1, grid_rows),
+        cols=max(1, grid_cols),
+    )
+
+    overlay_bgr = image_bgr.copy()
+    plant_results: list[PlantLeafResult] = []
+    plant_rows: list[dict[str, object]] = []
+    leaf_rows: list[dict[str, object]] = []
+
+    for idx, seedling in enumerate(seedling_regions):
+        analysis_bbox = _build_seedling_analysis_bbox(
+            seedling=seedling,
+            seedling_regions=seedling_regions,
+            image_shape=image_bgr.shape[:2],
+            tray_bbox=tray_bbox,
+        )
+        crop_x0, crop_y0, crop_x1, crop_y1 = analysis_bbox
+        crop_bgr = image_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
+        crop_container_mask_u8 = container_mask_u8[crop_y0:crop_y1, crop_x0:crop_x1]
+        crop_shoot_mask_u8 = global_shoot_mask_u8[crop_y0:crop_y1, crop_x0:crop_x1].copy()
+        crop_shoot_mask_u8 = cv2.bitwise_and(crop_shoot_mask_u8, crop_container_mask_u8)
+
+        anchor_global_x, anchor_global_y = seedling["anchor"]
+        anchor_local = (
+            int(anchor_global_x - crop_x0),
+            int(anchor_global_y - crop_y0),
+        )
+        shoot_bbox_global = seedling["bbox"]
+        shoot_bbox_local = (
+            int(shoot_bbox_global[0] - crop_x0),
+            int(shoot_bbox_global[1] - crop_y0),
+            int(shoot_bbox_global[2] - crop_x0),
+            int(shoot_bbox_global[3] - crop_y0),
+        )
+
+        root_support_mask_u8 = _segment_seedling_root_support_mask(
+            crop_bgr=crop_bgr,
+            crop_shoot_mask_u8=crop_shoot_mask_u8,
+            crop_container_mask_u8=crop_container_mask_u8,
+            anchor_local=anchor_local,
+            shoot_bbox_local=shoot_bbox_local,
+        )
+        primary_root_score_map = _compute_seedling_primary_root_score_map(
+            crop_bgr=crop_bgr,
+            crop_shoot_mask_u8=crop_shoot_mask_u8,
+            crop_container_mask_u8=crop_container_mask_u8,
+            anchor_local=anchor_local,
+            shoot_bbox_local=shoot_bbox_local,
+        )
+        root_parts = _classify_seedling_root_parts(
+            root_support_mask_u8,
+            anchor_local,
+            primary_root_score_map=primary_root_score_map,
+        )
+
+        leaf_label_map, leaf_count, canopy_area_px, min_leaf_area_px = _estimate_leaf_instances(
+            crop_shoot_mask_u8,
+            crop_bgr,
+            expected_groups=1,
+        )
+
+        site = PlantRegion(
+            name=str(seedling["name"]),
+            position=str(seedling["position"]),
+            site_index=int(seedling["site_index"]),
+            row_index=int(seedling["row_index"]),
+            col_index=int(seedling["col_index"]),
+            bbox=tuple(int(v) for v in seedling["bbox"]),
+        )
+        plant_traits, plant_leaf_rows = _compute_trait_rows(
+            crop_bgr=crop_bgr,
+            mask_u8=crop_shoot_mask_u8,
+            leaf_label_map=leaf_label_map,
+            site=site,
+            analysis_bbox=analysis_bbox,
+            min_leaf_area_px=min_leaf_area_px,
+            tray_profile=seedling_profile,
+            container_source=container_source,
+            circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+            circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+            circle_radius_scale=circle_radius_scale,
+            tray_long_side_cm=tray_long_side_cm,
+            tray_long_side_px=tray_long_side_px,
+            pixels_per_cm=pixels_per_cm,
+            pixels_per_cm_override=pixels_per_cm_override,
+            mm_per_pixel=mm_per_pixel,
+            scale_source=scale_source,
+        )
+        plant_traits.update(
+            _seedling_root_trait_columns(
+                root_parts=root_parts,
+                pixels_per_cm=pixels_per_cm,
+                shoot_area_px=float(plant_traits.get("Canopy Area (px)", 0) or 0.0),
+                anchor_global=(anchor_global_x, anchor_global_y),
+            )
+        )
+        plant_traits["Analysis Kind"] = ANALYSIS_KIND_SEEDLINGS
+        plant_traits["Shoot Area (px)"] = plant_traits.get("Canopy Area (px)")
+        plant_traits["Shoot Area (cm^2)"] = plant_traits.get("Canopy Area (cm^2)")
+        plant_traits["Shoot Perimeter (px)"] = plant_traits.get("Perimeter (px)")
+        plant_traits["Shoot Perimeter (cm)"] = plant_traits.get("Perimeter (cm)")
+        plant_traits["Shoot Solidity"] = plant_traits.get("Solidity")
+        plant_traits["Shoot Circularity"] = plant_traits.get("Circularity")
+        plant_traits["Shoot Aspect Ratio"] = plant_traits.get("Aspect Ratio")
+
+        for leaf_row in plant_leaf_rows:
+            leaf_row["Analysis Kind"] = ANALYSIS_KIND_SEEDLINGS
+            leaf_row["Organ"] = "Shoot leaf"
+
+        plant_result = PlantLeafResult(
+            name=site.name,
+            position=site.position,
+            bbox=analysis_bbox,
+            site_bbox=site.bbox,
+            leaf_count=int(leaf_count),
+            canopy_area_px=int(canopy_area_px),
+            min_leaf_area_px=int(min_leaf_area_px),
+            mask=crop_shoot_mask_u8,
+            leaf_label_map=leaf_label_map,
+            plant_traits=plant_traits,
+            leaf_traits=plant_leaf_rows,
+            shoot_mask=crop_shoot_mask_u8,
+            root_mask=root_parts["root_mask_u8"],
+            primary_root_mask=root_parts["primary_root_mask_u8"],
+            lateral_root_mask=root_parts["lateral_root_mask_u8"],
+            root_skeleton_mask=root_parts["skeleton_mask_u8"],
+        )
+        plant_results.append(plant_result)
+        plant_rows.append(plant_traits)
+        leaf_rows.extend(plant_leaf_rows)
+        _draw_seedling_overlay(overlay_bgr, plant_result, color=_plant_color_bgr(idx, len(seedling_regions)))
+
+    _draw_container_outline(overlay_bgr, tray_bbox, container_mask_u8)
+    plant_summary_df = pd.DataFrame(plant_rows)
+    leaf_detail_df = pd.DataFrame(leaf_rows)
+    count_columns = ["Plant", "Position", "Estimated Leaves", "Total Root Length (cm)", "Lateral Root Count"]
+    counts_df = plant_summary_df[[column for column in count_columns if column in plant_summary_df.columns]].copy()
+
+    return TrayAnalysisResult(
+        image_shape=tuple(int(v) for v in image_rgb.shape[:2]),
+        overlay_rgb=cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB),
+        analysis_kind=ANALYSIS_KIND_SEEDLINGS,
+        counts_df=counts_df,
+        plant_summary_df=plant_summary_df,
+        leaf_detail_df=leaf_detail_df,
+        tray_bbox=tray_bbox,
+        tray_profile_key=SEEDLINGS_PROFILE_KEY,
+        tray_profile_name=seedling_profile.name,
+        grid_rows=max(0, grid_rows),
+        grid_cols=max(0, grid_cols),
+        container_source=container_source,
+        circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+        circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+        circle_radius_scale=circle_radius_scale,
+        tray_long_side_px=float(tray_long_side_px),
+        tray_long_side_cm=float(tray_long_side_cm),
+        pixels_per_cm=pixels_per_cm,
+        pixels_per_cm_override=pixels_per_cm_override,
+        mm_per_pixel=mm_per_pixel,
+        scale_source=scale_source,
+        plant_results=plant_results,
+        segmentation_source="Seedling heuristic (green shoot mask + anchored root skeleton)",
+    )
+
+
+def _segment_seedling_shoot_mask(image_bgr: np.ndarray) -> np.ndarray:
+    if image_bgr.size == 0:
+        return np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
+    exg = (2 * rgb[:, :, 1]) - rgb[:, :, 0] - rgb[:, :, 2]
+    hsv_mask = cv2.inRange(
+        hsv,
+        np.array([22, 25, 35], dtype=np.uint8),
+        np.array([105, 255, 255], dtype=np.uint8),
+    )
+    exg_mask = ((exg > 8).astype(np.uint8) * 255)
+    mask = cv2.bitwise_and(hsv_mask, exg_mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), dtype=np.uint8), iterations=2)
+    return mask
+
+
+def _detect_seedling_regions(shoot_mask_u8: np.ndarray) -> tuple[list[dict[str, object]], int, int]:
+    binary = (shoot_mask_u8 > 0).astype(np.uint8)
+    if not np.any(binary):
+        return [], 0, 0
+
+    total_green_area_px = int(np.count_nonzero(binary))
+    min_component_area_px = max(300, int(total_green_area_px * 0.01))
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    components: list[dict[str, object]] = []
+    for label_idx in range(1, num_labels):
+        area_px = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area_px < min_component_area_px:
+            continue
+        x0 = int(stats[label_idx, cv2.CC_STAT_LEFT])
+        y0 = int(stats[label_idx, cv2.CC_STAT_TOP])
+        width = int(stats[label_idx, cv2.CC_STAT_WIDTH])
+        height = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+        if width < max(50, int(height * 0.35)):
+            continue
+        component_mask = labels == label_idx
+        ys, xs = np.where(component_mask)
+        if xs.size == 0 or ys.size == 0:
+            continue
+        anchor_band = xs[ys >= (ys.max() - 4)]
+        anchor_x = int(np.median(anchor_band)) if anchor_band.size > 0 else int(round(float(centroids[label_idx, 0])))
+        anchor_y = int(ys.max())
+        components.append(
+            {
+                "bbox": (x0, y0, x0 + width, y0 + height),
+                "centroid_x": float(centroids[label_idx, 0]),
+                "centroid_y": float(centroids[label_idx, 1]),
+                "anchor": (anchor_x, anchor_y),
+                "height": height,
+            }
+        )
+
+    if not components:
+        return [], 0, 0
+
+    components.sort(key=lambda item: (float(item["centroid_y"]), float(item["centroid_x"])))
+    median_height = float(np.median([item["height"] for item in components])) if components else 0.0
+    row_tolerance_px = max(45.0, median_height * 0.7)
+    row_groups: list[dict[str, object]] = []
+
+    for component in components:
+        assigned = False
+        for row_group in row_groups:
+            if abs(float(component["centroid_y"]) - float(row_group["mean_y"])) <= row_tolerance_px:
+                row_group["items"].append(component)
+                row_group["mean_y"] = float(np.mean([float(item["centroid_y"]) for item in row_group["items"]]))
+                assigned = True
+                break
+        if not assigned:
+            row_groups.append({"mean_y": float(component["centroid_y"]), "items": [component]})
+
+    row_groups.sort(key=lambda row_group: float(row_group["mean_y"]))
+    grid_rows = len(row_groups)
+    grid_cols = max(len(row_group["items"]) for row_group in row_groups)
+    seedling_regions: list[dict[str, object]] = []
+    site_index = 0
+    for row_idx, row_group in enumerate(row_groups):
+        row_items = sorted(row_group["items"], key=lambda item: float(item["centroid_x"]))
+        for col_idx, component in enumerate(row_items):
+            site_index += 1
+            component["name"] = f"Seedling {site_index}"
+            component["position"] = _format_grid_position(row_idx, col_idx, grid_rows, grid_cols)
+            component["site_index"] = site_index
+            component["row_index"] = row_idx
+            component["col_index"] = col_idx
+            seedling_regions.append(component)
+
+    return seedling_regions, grid_rows, grid_cols
+
+
+def _build_seedling_analysis_bbox(
+    seedling: dict[str, object],
+    seedling_regions: list[dict[str, object]],
+    image_shape: tuple[int, int],
+    tray_bbox: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    image_h, image_w = image_shape
+    tray_x0, tray_y0, tray_x1, tray_y1 = tray_bbox
+    shoot_bbox = tuple(int(v) for v in seedling["bbox"])
+    x0, y0, x1, y1 = shoot_bbox
+    shoot_w = max(1, x1 - x0)
+    shoot_h = max(1, y1 - y0)
+    pad_top = max(16, int(round(shoot_h * 0.12)))
+    horizontal_margin_px = max(18, int(round(shoot_w * 0.16)))
+
+    same_row_seedlings = sorted(
+        [item for item in seedling_regions if int(item["row_index"]) == int(seedling["row_index"])],
+        key=lambda item: float(item["centroid_x"]),
+    )
+    current_idx = next(
+        (
+            idx
+            for idx, item in enumerate(same_row_seedlings)
+            if int(item["site_index"]) == int(seedling["site_index"])
+        ),
+        0,
+    )
+    left_bound = tray_x0
+    right_bound = tray_x1
+    if current_idx > 0:
+        prev_bbox = tuple(int(v) for v in same_row_seedlings[current_idx - 1]["bbox"])
+        left_bound = max(tray_x0, int(round((prev_bbox[2] + x0) / 2.0)))
+    if current_idx < len(same_row_seedlings) - 1:
+        next_bbox = tuple(int(v) for v in same_row_seedlings[current_idx + 1]["bbox"])
+        right_bound = min(tray_x1, int(round((x1 + next_bbox[0]) / 2.0)))
+    return (
+        max(tray_x0, left_bound - horizontal_margin_px),
+        max(tray_y0, y0 - pad_top),
+        min(tray_x1, right_bound + horizontal_margin_px),
+        min(tray_y1, image_h),
+    )
+
+
+def _segment_seedling_root_support_mask(
+    crop_bgr: np.ndarray,
+    crop_shoot_mask_u8: np.ndarray,
+    crop_container_mask_u8: np.ndarray,
+    anchor_local: tuple[int, int],
+    shoot_bbox_local: tuple[int, int, int, int],
+) -> np.ndarray:
+    if crop_bgr.size == 0:
+        return np.zeros(crop_bgr.shape[:2], dtype=np.uint8)
+
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    blurred = cv2.GaussianBlur(denoised, (0, 0), 7)
+    contrast = cv2.subtract(denoised, blurred)
+
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    candidate = ((contrast > 7) & (sat < 135) & (val > 35)).astype(np.uint8) * 255
+    candidate = cv2.bitwise_and(candidate, cv2.bitwise_not(crop_shoot_mask_u8))
+    candidate = cv2.bitwise_and(candidate, crop_container_mask_u8)
+
+    ax, ay = int(anchor_local[0]), int(anchor_local[1])
+    x0, _, x1, _ = shoot_bbox_local
+    crop_h, crop_w = candidate.shape[:2]
+    xs = np.arange(crop_w)[None, :]
+    ys = np.arange(crop_h)[:, None]
+    top_half_width_px = max(int(crop_w * 0.38), int((x1 - x0) * 1.1), 90)
+    bottom_half_width_px = max(int(crop_w * 0.08), 16)
+    row_fraction = np.clip(ys / max(1, crop_h - 1), 0.0, 1.0)
+    half_width_px = top_half_width_px - ((top_half_width_px - bottom_half_width_px) * row_fraction)
+    tapered_corridor = np.abs(xs - ax) <= half_width_px
+    candidate = ((candidate > 0) & tapered_corridor & (ys >= max(0, ay - 8))).astype(np.uint8) * 255
+    candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8), iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((candidate > 0).astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return np.zeros_like(candidate)
+
+    keep = np.zeros_like(candidate)
+    anchor_disk = np.zeros_like(candidate)
+    cv2.circle(anchor_disk, (ax, ay), 16, 255, -1)
+    max_component_area_px = max(2400, int(candidate.size * 0.012))
+
+    component_meta: list[dict[str, object]] = []
+    for label_idx in range(1, num_labels):
+        area_px = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area_px < 6:
+            continue
+        component_mask = labels == label_idx
+        bbox_left = int(stats[label_idx, cv2.CC_STAT_LEFT])
+        bbox_top = int(stats[label_idx, cv2.CC_STAT_TOP])
+        bbox_width = int(stats[label_idx, cv2.CC_STAT_WIDTH])
+        bbox_height = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+        ys_component, xs_component = np.where(component_mask)
+        if xs_component.size == 0 or ys_component.size == 0:
+            continue
+        distance_to_anchor_px = float(
+            np.min(((xs_component - ax) ** 2 + (ys_component - ay) ** 2).astype(np.float64)) ** 0.5
+        )
+        component_meta.append(
+            {
+                "label_idx": label_idx,
+                "mask": component_mask,
+                "area_px": area_px,
+                "bbox_left": bbox_left,
+                "bbox_top": bbox_top,
+                "bbox_width": bbox_width,
+                "bbox_height": bbox_height,
+                "distance_to_anchor_px": distance_to_anchor_px,
+                "center_x": float(xs_component.mean()),
+                "center_y": float(ys_component.mean()),
+            }
+        )
+        if area_px <= max_component_area_px and (
+            np.any(anchor_disk[component_mask] > 0) or distance_to_anchor_px <= 14.0
+        ):
+            keep[component_mask] = 255
+
+    if not np.any(keep > 0):
+        return keep
+
+    for _ in range(4):
+        dilated_keep = cv2.dilate(keep, np.ones((7, 7), dtype=np.uint8), iterations=1)
+        changed = False
+        for component in component_meta:
+            component_mask = component["mask"]
+            if np.any(keep[component_mask] > 0):
+                continue
+            area_px = int(component["area_px"])
+            bbox_width = int(component["bbox_width"])
+            bbox_height = int(component["bbox_height"])
+            center_y = float(component["center_y"])
+            allowed_center_drift_px = float(
+                max(bottom_half_width_px * 2, top_half_width_px - ((top_half_width_px - bottom_half_width_px) * min(1.0, center_y / max(1, crop_h - 1))))
+            )
+            if area_px > max_component_area_px:
+                continue
+            if abs(float(component["center_x"]) - float(ax)) > allowed_center_drift_px:
+                continue
+            if bbox_height < 4:
+                continue
+            if bbox_width > max(90, int(crop_w * 0.22)) and bbox_height < bbox_width:
+                continue
+            if np.any(dilated_keep[component_mask] > 0):
+                keep[component_mask] = 255
+                changed = True
+        if not changed:
+            break
+
+    keep = cv2.bitwise_and(keep, crop_container_mask_u8)
+    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    return keep
+
+
+def _compute_seedling_primary_root_score_map(
+    crop_bgr: np.ndarray,
+    crop_shoot_mask_u8: np.ndarray,
+    crop_container_mask_u8: np.ndarray,
+    anchor_local: tuple[int, int],
+    shoot_bbox_local: tuple[int, int, int, int],
+) -> np.ndarray:
+    if crop_bgr.size == 0:
+        return np.zeros(crop_bgr.shape[:2], dtype=np.float32)
+
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    blurred = cv2.GaussianBlur(denoised, (0, 0), 7)
+    contrast = cv2.subtract(denoised, blurred).astype(np.float32)
+    bright_tophat = cv2.morphologyEx(
+        denoised,
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+    ).astype(np.float32)
+    warm_tophat = cv2.morphologyEx(
+        lab[:, :, 2],
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
+    ).astype(np.float32)
+
+    score_map = (
+        np.maximum(contrast - 3.0, 0.0) * 1.3
+        + np.maximum(bright_tophat - 4.0, 0.0)
+        + np.maximum(warm_tophat - 3.0, 0.0) * 0.7
+    )
+
+    val = hsv[:, :, 2]
+    score_map[(crop_shoot_mask_u8 > 0) | (crop_container_mask_u8 == 0) | (val <= 30)] = 0.0
+
+    ax, ay = int(anchor_local[0]), int(anchor_local[1])
+    x0, _, x1, _ = shoot_bbox_local
+    crop_h, crop_w = score_map.shape[:2]
+    xs = np.arange(crop_w)[None, :]
+    ys = np.arange(crop_h)[:, None]
+    top_half_width_px = max(int(crop_w * 0.38), int((x1 - x0) * 1.1), 90)
+    bottom_half_width_px = max(int(crop_w * 0.08), 16)
+    row_fraction = np.clip(ys / max(1, crop_h - 1), 0.0, 1.0)
+    half_width_px = top_half_width_px - ((top_half_width_px - bottom_half_width_px) * row_fraction)
+    tapered_corridor = (np.abs(xs - ax) <= half_width_px) & (ys >= max(0, ay - 8))
+    score_map[~tapered_corridor] = 0.0
+    return score_map
+
+
+def _classify_seedling_root_parts(
+    root_support_mask_u8: np.ndarray,
+    anchor_local: tuple[int, int],
+    primary_root_score_map: np.ndarray | None = None,
+) -> dict[str, object]:
+    empty_mask_u8 = np.zeros_like(root_support_mask_u8, dtype=np.uint8)
+    if root_support_mask_u8.size == 0 or not np.any(root_support_mask_u8 > 0):
+        return {
+            "root_mask_u8": empty_mask_u8,
+            "primary_root_mask_u8": empty_mask_u8,
+            "lateral_root_mask_u8": empty_mask_u8,
+            "skeleton_mask_u8": empty_mask_u8,
+            "primary_skeleton_mask_u8": empty_mask_u8,
+            "lateral_skeleton_mask_u8": empty_mask_u8,
+            "total_root_length_px": 0.0,
+            "primary_root_length_px": 0.0,
+            "lateral_root_length_px": 0.0,
+            "endpoint_count": 0,
+            "lateral_root_count": 0,
+            "avg_root_thickness_px": None,
+        }
+
+    support_mask_u8 = cv2.morphologyEx(root_support_mask_u8, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    support_mask_u8 = cv2.morphologyEx(support_mask_u8, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8), iterations=1)
+    skeleton_mask_u8 = _skeletonize_mask(support_mask_u8)
+    start_xy = _nearest_nonzero_point(skeleton_mask_u8, anchor_local)
+    connected_skeleton_mask_u8 = (
+        _connected_skeleton_component_from_start(skeleton_mask_u8, start_xy)
+        if start_xy is not None
+        else np.zeros_like(skeleton_mask_u8)
+    )
+    skeleton_primary_path = _trace_primary_root_path(connected_skeleton_mask_u8, start_xy) if start_xy is not None else []
+    score_primary_path = _trace_primary_root_path_from_score(primary_root_score_map, anchor_local)
+    primary_path = (
+        score_primary_path
+        if _polyline_length_px(score_primary_path) > _polyline_length_px(skeleton_primary_path)
+        else skeleton_primary_path
+    )
+    primary_skeleton_mask_u8 = np.zeros_like(support_mask_u8)
+    for x_coord, y_coord in primary_path:
+        if 0 <= int(y_coord) < primary_skeleton_mask_u8.shape[0] and 0 <= int(x_coord) < primary_skeleton_mask_u8.shape[1]:
+            primary_skeleton_mask_u8[int(y_coord), int(x_coord)] = 255
+
+    remaining_skeleton_mask_u8 = cv2.bitwise_and(
+        connected_skeleton_mask_u8,
+        cv2.bitwise_not(primary_skeleton_mask_u8),
+    )
+    lateral_skeleton_mask_u8, lateral_root_count, lateral_root_length_px = _filter_lateral_root_skeleton(
+        remaining_skeleton_mask_u8,
+        min_length_px=max(8.0, _polyline_length_px(primary_path) * 0.01),
+    )
+    total_skeleton_mask_u8 = cv2.bitwise_or(primary_skeleton_mask_u8, lateral_skeleton_mask_u8)
+
+    primary_support_mask_u8 = _binary_root_mask_from_score_map(primary_root_score_map)
+    primary_root_mask_u8 = _refine_root_mask_from_skeleton(
+        primary_support_mask_u8,
+        primary_skeleton_mask_u8,
+        radius_px=6,
+    )
+    root_mask_u8 = cv2.bitwise_or(support_mask_u8, primary_root_mask_u8)
+    lateral_root_mask_u8 = cv2.bitwise_and(root_mask_u8, cv2.bitwise_not(primary_root_mask_u8))
+    if np.any(lateral_skeleton_mask_u8 > 0) and not np.any(lateral_root_mask_u8 > 0):
+        lateral_root_mask_u8 = _refine_root_mask_from_skeleton(support_mask_u8, lateral_skeleton_mask_u8, radius_px=3)
+        root_mask_u8 = cv2.bitwise_or(primary_root_mask_u8, lateral_root_mask_u8)
+
+    primary_root_length_px = _polyline_length_px(primary_path)
+    total_root_length_px = primary_root_length_px + lateral_root_length_px
+    endpoint_count = _count_skeleton_endpoints(total_skeleton_mask_u8)
+    avg_root_thickness_px = _safe_ratio(np.count_nonzero(root_mask_u8), total_root_length_px, digits=4)
+
+    return {
+        "root_mask_u8": root_mask_u8,
+        "primary_root_mask_u8": primary_root_mask_u8,
+        "lateral_root_mask_u8": lateral_root_mask_u8,
+        "skeleton_mask_u8": total_skeleton_mask_u8,
+        "primary_skeleton_mask_u8": primary_skeleton_mask_u8,
+        "lateral_skeleton_mask_u8": lateral_skeleton_mask_u8,
+        "total_root_length_px": _round_or_none(total_root_length_px, 2) or 0.0,
+        "primary_root_length_px": _round_or_none(primary_root_length_px, 2) or 0.0,
+        "lateral_root_length_px": _round_or_none(lateral_root_length_px, 2) or 0.0,
+        "endpoint_count": int(endpoint_count),
+        "lateral_root_count": int(lateral_root_count),
+        "avg_root_thickness_px": avg_root_thickness_px,
+    }
+
+
+def _seedling_root_trait_columns(
+    root_parts: dict[str, object],
+    pixels_per_cm: float | None,
+    shoot_area_px: float,
+    anchor_global: tuple[int, int],
+) -> dict[str, object]:
+    root_mask_u8 = root_parts["root_mask_u8"]
+    primary_root_mask_u8 = root_parts["primary_root_mask_u8"]
+    lateral_root_mask_u8 = root_parts["lateral_root_mask_u8"]
+
+    root_stats = _shape_stats_from_mask(root_mask_u8 > 0)
+    primary_root_stats = _shape_stats_from_mask(primary_root_mask_u8 > 0)
+    lateral_root_stats = _shape_stats_from_mask(lateral_root_mask_u8 > 0)
+    total_root_length_px = float(root_parts["total_root_length_px"])
+    primary_root_length_px = float(root_parts["primary_root_length_px"])
+    lateral_root_length_px = float(root_parts["lateral_root_length_px"])
+
+    return {
+        "Seedling Anchor X": int(anchor_global[0]),
+        "Seedling Anchor Y": int(anchor_global[1]),
+        "Root Area (px)": int(root_stats["area_px"]),
+        "Root Area (cm^2)": _area_px_to_cm2(root_stats["area_px"], pixels_per_cm),
+        "Primary Root Area (px)": int(primary_root_stats["area_px"]),
+        "Primary Root Area (cm^2)": _area_px_to_cm2(primary_root_stats["area_px"], pixels_per_cm),
+        "Lateral Root Area (px)": int(lateral_root_stats["area_px"]),
+        "Lateral Root Area (cm^2)": _area_px_to_cm2(lateral_root_stats["area_px"], pixels_per_cm),
+        "Total Root Length (px)": _round_or_none(total_root_length_px, 2),
+        "Total Root Length (cm)": _length_px_to_cm(total_root_length_px, pixels_per_cm),
+        "Primary Root Length (px)": _round_or_none(primary_root_length_px, 2),
+        "Primary Root Length (cm)": _length_px_to_cm(primary_root_length_px, pixels_per_cm),
+        "Lateral Root Length (px)": _round_or_none(lateral_root_length_px, 2),
+        "Lateral Root Length (cm)": _length_px_to_cm(lateral_root_length_px, pixels_per_cm),
+        "Root Endpoint Count": int(root_parts["endpoint_count"]),
+        "Lateral Root Count": int(root_parts["lateral_root_count"]),
+        "Avg Root Thickness (px)": root_parts["avg_root_thickness_px"],
+        "Avg Root Thickness (cm)": _length_px_to_cm(root_parts["avg_root_thickness_px"], pixels_per_cm),
+        "Root:Shoot Area Ratio": _safe_ratio(root_stats["area_px"], shoot_area_px, digits=4),
+        "Primary:Total Root Length Ratio": _safe_ratio(primary_root_length_px, total_root_length_px, digits=4),
+    }
+
+
+def _skeletonize_mask(mask_u8: np.ndarray) -> np.ndarray:
+    working_mask = (mask_u8 > 0).astype(np.uint8) * 255
+    skeleton_mask = np.zeros_like(working_mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    while True:
+        eroded = cv2.erode(working_mask, kernel)
+        temp = cv2.dilate(eroded, kernel)
+        temp = cv2.subtract(working_mask, temp)
+        skeleton_mask = cv2.bitwise_or(skeleton_mask, temp)
+        working_mask = eroded
+        if cv2.countNonZero(working_mask) == 0:
+            break
+
+    return skeleton_mask
+
+
+def _nearest_nonzero_point(mask_u8: np.ndarray, anchor_xy: tuple[int, int]) -> tuple[int, int] | None:
+    ys, xs = np.where(mask_u8 > 0)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    anchor_x, anchor_y = int(anchor_xy[0]), int(anchor_xy[1])
+    distances_sq = ((xs - anchor_x) ** 2 + (ys - anchor_y) ** 2).astype(np.float64)
+    nearest_idx = int(np.argmin(distances_sq))
+    return int(xs[nearest_idx]), int(ys[nearest_idx])
+
+
+def _connected_skeleton_component_from_start(
+    skeleton_mask_u8: np.ndarray,
+    start_xy: tuple[int, int],
+) -> np.ndarray:
+    binary = (skeleton_mask_u8 > 0).astype(np.uint8)
+    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num_labels <= 1:
+        return np.zeros_like(skeleton_mask_u8)
+
+    start_x, start_y = int(start_xy[0]), int(start_xy[1])
+    label_at_start = int(labels[start_y, start_x]) if 0 <= start_y < labels.shape[0] and 0 <= start_x < labels.shape[1] else 0
+    if label_at_start <= 0:
+        return np.zeros_like(skeleton_mask_u8)
+    return ((labels == label_at_start).astype(np.uint8) * 255)
+
+
+def _trace_primary_root_path(
+    skeleton_mask_u8: np.ndarray,
+    start_xy: tuple[int, int],
+) -> list[tuple[int, int]]:
+    ys, xs = np.where(skeleton_mask_u8 > 0)
+    if xs.size == 0 or ys.size == 0:
+        return []
+
+    coordinates = list(zip(xs.tolist(), ys.tolist()))
+    coordinate_to_index = {coordinate: idx for idx, coordinate in enumerate(coordinates)}
+    neighbors: list[list[int]] = [[] for _ in coordinates]
+    unique_neighbor_offsets = (
+        (-1, -1), (0, -1), (1, -1),
+        (-1, 0),            (1, 0),
+        (-1, 1),  (0, 1),   (1, 1),
+    )
+    for idx, (x_coord, y_coord) in enumerate(coordinates):
+        for dx, dy in unique_neighbor_offsets:
+            neighbor_idx = coordinate_to_index.get((x_coord + dx, y_coord + dy))
+            if neighbor_idx is not None:
+                neighbors[idx].append(neighbor_idx)
+
+    start_index = coordinate_to_index.get((int(start_xy[0]), int(start_xy[1])))
+    if start_index is None:
+        start_index = int(
+            np.argmin(
+                [
+                    (x_coord - int(start_xy[0])) ** 2 + (y_coord - int(start_xy[1])) ** 2
+                    for x_coord, y_coord in coordinates
+                ]
+            )
+        )
+
+    parent_by_index = {start_index: -1}
+    queue = deque([start_index])
+    while queue:
+        current_idx = queue.popleft()
+        for neighbor_idx in neighbors[current_idx]:
+            if neighbor_idx in parent_by_index:
+                continue
+            parent_by_index[neighbor_idx] = current_idx
+            queue.append(neighbor_idx)
+
+    start_x, start_y = coordinates[start_index]
+    endpoint_candidates: list[tuple[float, int]] = []
+    for idx in parent_by_index:
+        neighbor_count = sum(1 for neighbor_idx in neighbors[idx] if neighbor_idx in parent_by_index)
+        if idx != start_index and neighbor_count <= 1:
+            x_coord, y_coord = coordinates[idx]
+            score = (y_coord - start_y) - (0.35 * abs(x_coord - start_x))
+            endpoint_candidates.append((float(score), idx))
+
+    if endpoint_candidates:
+        _, end_index = max(endpoint_candidates, key=lambda item: item[0])
+    else:
+        end_index = max(parent_by_index, key=lambda idx: coordinates[idx][1])
+
+    path: list[tuple[int, int]] = []
+    current_idx = end_index
+    while current_idx != -1:
+        path.append(coordinates[current_idx])
+        current_idx = parent_by_index[current_idx]
+    path.reverse()
+    return path
+
+
+def _trace_primary_root_path_from_score(
+    score_map: np.ndarray | None,
+    anchor_xy: tuple[int, int],
+) -> list[tuple[int, int]]:
+    if score_map is None or score_map.size == 0:
+        return []
+
+    map_h, map_w = score_map.shape[:2]
+    anchor_x = int(np.clip(int(anchor_xy[0]), 0, max(0, map_w - 1)))
+    anchor_y = int(np.clip(int(anchor_xy[1]), 0, max(0, map_h - 1)))
+    current_x = anchor_x
+    gap_rows = 0
+    search_radius_px = max(12, int(round(map_w * 0.025)))
+    max_gap_rows = 35
+    min_signal_score = 12.0
+    max_step_px = 6
+    path: list[tuple[int, int]] = []
+    started = False
+
+    for y_coord in range(max(0, anchor_y - 3), map_h):
+        x0 = max(0, current_x - search_radius_px)
+        x1 = min(map_w, current_x + search_radius_px + 1)
+        if x1 <= x0:
+            break
+        window = score_map[max(0, y_coord - 1): min(map_h, y_coord + 2), x0:x1].sum(axis=0)
+        if window.size == 0:
+            continue
+        offsets = np.arange(x0, x1, dtype=np.int32)
+        penalized_scores = window - (np.abs(offsets - current_x).astype(np.float32) * 0.9)
+        best_idx = int(np.argmax(penalized_scores))
+        best_x = int(offsets[best_idx])
+        raw_score = float(window[best_idx])
+        if raw_score < min_signal_score:
+            gap_rows += 1
+            if started and gap_rows > max_gap_rows:
+                break
+            continue
+        started = True
+        gap_rows = 0
+        current_x = int(np.clip(best_x, current_x - max_step_px, current_x + max_step_px))
+        path.append((current_x, y_coord))
+
+    if len(path) <= 2:
+        return path
+
+    x_values = np.array([x_coord for x_coord, _ in path], dtype=np.float32)
+    smoothed_x_values = x_values.copy()
+    window_radius = 61
+    for idx in range(len(path)):
+        start_idx = max(0, idx - window_radius)
+        end_idx = min(len(path), idx + window_radius + 1)
+        smoothed_x_values[idx] = float(np.median(x_values[start_idx:end_idx]))
+    return [(int(round(smoothed_x_values[idx])), int(y_coord)) for idx, (_, y_coord) in enumerate(path)]
+
+
+def _binary_root_mask_from_score_map(score_map: np.ndarray | None) -> np.ndarray:
+    if score_map is None or score_map.size == 0:
+        return np.zeros((0, 0), dtype=np.uint8)
+    if not np.any(score_map > 0):
+        return np.zeros(score_map.shape[:2], dtype=np.uint8)
+    threshold = max(14.0, float(np.percentile(score_map[score_map > 0], 90)))
+    binary_mask_u8 = ((score_map >= threshold).astype(np.uint8) * 255)
+    binary_mask_u8 = cv2.morphologyEx(binary_mask_u8, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8), iterations=1)
+    binary_mask_u8 = cv2.morphologyEx(binary_mask_u8, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    return binary_mask_u8
+
+
+def _filter_lateral_root_skeleton(
+    remaining_skeleton_mask_u8: np.ndarray,
+    min_length_px: float,
+) -> tuple[np.ndarray, int, float]:
+    binary = (remaining_skeleton_mask_u8 > 0).astype(np.uint8)
+    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num_labels <= 1:
+        return np.zeros_like(remaining_skeleton_mask_u8), 0, 0.0
+
+    lateral_mask_u8 = np.zeros_like(remaining_skeleton_mask_u8)
+    lateral_root_count = 0
+    lateral_root_length_px = 0.0
+    for label_idx in range(1, num_labels):
+        component_mask_u8 = ((labels == label_idx).astype(np.uint8) * 255)
+        component_length_px = _skeleton_length_px(component_mask_u8)
+        if component_length_px < float(min_length_px):
+            continue
+        lateral_mask_u8 = cv2.bitwise_or(lateral_mask_u8, component_mask_u8)
+        lateral_root_count += 1
+        lateral_root_length_px += component_length_px
+
+    return lateral_mask_u8, lateral_root_count, lateral_root_length_px
+
+
+def _refine_root_mask_from_skeleton(
+    support_mask_u8: np.ndarray,
+    skeleton_mask_u8: np.ndarray,
+    radius_px: int,
+) -> np.ndarray:
+    if not np.any(skeleton_mask_u8 > 0):
+        return np.zeros_like(support_mask_u8)
+
+    diameter_px = max(3, (2 * int(radius_px)) + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (diameter_px, diameter_px))
+    corridor_mask_u8 = cv2.dilate(skeleton_mask_u8, kernel, iterations=1)
+    refined_mask_u8 = cv2.bitwise_and(support_mask_u8, corridor_mask_u8)
+    if np.count_nonzero(refined_mask_u8) < np.count_nonzero(skeleton_mask_u8):
+        refined_mask_u8 = corridor_mask_u8
+    return refined_mask_u8
+
+
+def _polyline_length_px(path: list[tuple[int, int]]) -> float:
+    if len(path) < 2:
+        return 0.0
+    length_px = 0.0
+    for (x0, y0), (x1, y1) in zip(path[:-1], path[1:]):
+        length_px += hypot(float(x1 - x0), float(y1 - y0))
+    return length_px
+
+
+def _skeleton_length_px(skeleton_mask_u8: np.ndarray) -> float:
+    ys, xs = np.where(skeleton_mask_u8 > 0)
+    if xs.size == 0 or ys.size == 0:
+        return 0.0
+
+    coordinates = {(int(x_coord), int(y_coord)) for x_coord, y_coord in zip(xs, ys)}
+    unique_offsets = ((1, 0), (0, 1), (1, 1), (1, -1))
+    length_px = 0.0
+    for x_coord, y_coord in coordinates:
+        for dx, dy in unique_offsets:
+            if (x_coord + dx, y_coord + dy) in coordinates:
+                length_px += hypot(float(dx), float(dy))
+    return float(length_px)
+
+
+def _count_skeleton_endpoints(skeleton_mask_u8: np.ndarray) -> int:
+    binary = skeleton_mask_u8 > 0
+    if not np.any(binary):
+        return 0
+
+    endpoint_count = 0
+    ys, xs = np.where(binary)
+    for x_coord, y_coord in zip(xs, ys):
+        neighborhood = binary[
+            max(0, y_coord - 1): min(binary.shape[0], y_coord + 2),
+            max(0, x_coord - 1): min(binary.shape[1], x_coord + 2),
+        ]
+        neighbor_count = int(np.count_nonzero(neighborhood)) - 1
+        if neighbor_count == 1:
+            endpoint_count += 1
+    return endpoint_count
+
+
 def _normalize_rgb_image(image_rgb: np.ndarray) -> np.ndarray:
+    if not isinstance(image_rgb, np.ndarray):
+        image_rgb = np.asarray(image_rgb)
     if image_rgb.ndim == 2:
         return np.stack([image_rgb] * 3, axis=-1)
     if image_rgb.ndim != 3:
@@ -1464,6 +2374,80 @@ def _draw_region_overlay(image_bgr: np.ndarray, plant_result: PlantLeafResult, c
         (caption_x, caption_y),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.62,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_seedling_overlay(image_bgr: np.ndarray, plant_result: PlantLeafResult, color: tuple[int, int, int]) -> None:
+    x0, y0, x1, y1 = plant_result.bbox
+    crop = image_bgr[y0:y1, x0:x1]
+    shoot_mask = plant_result.shoot_mask if plant_result.shoot_mask is not None else plant_result.mask
+    root_mask = plant_result.root_mask
+    primary_root_mask = plant_result.primary_root_mask
+    lateral_root_mask = plant_result.lateral_root_mask
+    root_skeleton_mask = plant_result.root_skeleton_mask
+
+    if shoot_mask is not None and np.any(shoot_mask > 0):
+        shoot_layer = np.zeros_like(crop)
+        shoot_layer[:] = color
+        crop[shoot_mask > 0] = cv2.addWeighted(crop[shoot_mask > 0], 0.68, shoot_layer[shoot_mask > 0], 0.32, 0)
+
+    if root_mask is not None and np.any(root_mask > 0):
+        root_layer = np.zeros_like(crop)
+        root_layer[:] = (80, 180, 255)
+        crop[root_mask > 0] = cv2.addWeighted(crop[root_mask > 0], 0.75, root_layer[root_mask > 0], 0.25, 0)
+
+    if primary_root_mask is not None and np.any(primary_root_mask > 0):
+        primary_layer = np.zeros_like(crop)
+        primary_layer[:] = (255, 220, 90)
+        crop[primary_root_mask > 0] = cv2.addWeighted(crop[primary_root_mask > 0], 0.6, primary_layer[primary_root_mask > 0], 0.4, 0)
+
+    if lateral_root_mask is not None and np.any(lateral_root_mask > 0):
+        lateral_layer = np.zeros_like(crop)
+        lateral_layer[:] = (214, 114, 255)
+        crop[lateral_root_mask > 0] = cv2.addWeighted(crop[lateral_root_mask > 0], 0.72, lateral_layer[lateral_root_mask > 0], 0.28, 0)
+
+    if root_skeleton_mask is not None and np.any(root_skeleton_mask > 0):
+        crop[root_skeleton_mask > 0] = (255, 255, 255)
+
+    label_map = plant_result.leaf_label_map
+    for leaf_id in [int(value) for value in np.unique(label_map) if int(value) > 0]:
+        leaf_mask = ((label_map == leaf_id).astype(np.uint8) * 255)
+        contours, _ = cv2.findContours(leaf_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cv2.drawContours(crop, contours, -1, color, 2)
+
+    site_x0, site_y0, site_x1, site_y1 = plant_result.site_bbox
+    anchor_x = int(round((site_x0 + site_x1) / 2.0))
+    anchor_y = int(site_y1)
+    cv2.circle(image_bgr, (anchor_x, anchor_y), 6, color, -1)
+
+    caption_x = max(12, x0 + 12)
+    caption_y = max(28, y0 + 28)
+    root_length_cm = plant_result.plant_traits.get("Total Root Length (cm)")
+    lateral_root_count = plant_result.plant_traits.get("Lateral Root Count")
+    root_suffix = ""
+    if root_length_cm is not None:
+        root_suffix = f" | {root_length_cm:.2f} cm"
+    elif lateral_root_count is not None:
+        root_suffix = f" | LR {int(lateral_root_count)}"
+    caption = f"{plant_result.name}: {plant_result.leaf_count}{root_suffix}"
+    (caption_w, _), _ = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.56, 2)
+    cv2.rectangle(
+        image_bgr,
+        (caption_x - 8, caption_y - 18),
+        (caption_x + caption_w + 10, caption_y + 8),
+        (18, 18, 18),
+        -1,
+    )
+    cv2.putText(
+        image_bgr,
+        caption,
+        (caption_x, caption_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.56,
         color,
         2,
         cv2.LINE_AA,

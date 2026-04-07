@@ -1,56 +1,60 @@
 # Plant Tray Phenotyping Dashboard
 
-Streamlit Community Cloud-ready app for potato, soybean, and Arabidopsis tray phenotyping.
+Streamlit Community Cloud app for tray, chamber, and seedling phenotyping.
 
-## Included
+## Included workflows
 
-- `streamlit_app.py`: Streamlit entrypoint for Community Cloud
-- `tray_analyzer.py`: tray segmentation, ownership, and trait extraction
-- `requirements.txt`: Python dependencies for deployment
-- `batch_input/` and `batch_output/`: optional leftover local batch folders
+- Potato / soybean `2x2` trays
+- Arabidopsis `4x5` trays
+- Universal custom grids
+- Seedlings from flat roots + shoots images
+- Linked seedling experiments with:
+  - top-view shoots
+  - side-view shoot height
+  - flat roots + shoots
 
-## GitHub Push
+## Linked seedling workflow
 
-This folder is already initialized as a local Git repository.
+In `Tray layout = Seedlings`, switch `Seedling workflow` to:
 
-If you want to push it with GitHub CLI:
+- `Linked experiment: top view + side view + flat roots`
+
+Then upload the three modalities separately. The app pairs experiments by upload order and links seedlings left-to-right across the three views.
+
+Outputs include:
+
+- `experiment_summary.csv`
+- `seedling_multiview_summary.csv`
+- `top_view_leaf_details.csv`
+- `flat_view_leaf_details.csv`
+- a linked results ZIP with originals, overlays, and masks
+
+## Calibration notes
+
+- Use `Tray long side (cm)` when a tray scale is visible.
+- Use `Pixels Per Cm Override` when no tray scale is available.
+- In linked seedling experiments, top, side, and flat images each have their own manual `pixels / cm` input.
+- For flat seedling root images on dark backgrounds, `Full image` is usually the right container mode.
+
+## Local run
 
 ```bash
-cd /Users/viniciuslube/Downloads/PlantTrayDashboard-StreamlitCloud-Repo
-git add .
-git commit -m "Initial Streamlit Community Cloud app"
-gh repo create plant-tray-phenotyping-dashboard --private --source=. --remote=origin --push
+cd "/Users/viniciuslube/Downloads/PlantTrayDashboard-StreamlitCloud-Repo"
+python3 -m venv .venv
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/streamlit run streamlit_app.py
 ```
 
-If you prefer GitHub Desktop:
+## Streamlit Community Cloud
 
-1. Add this folder as an existing local repository.
-2. Publish it to GitHub.
-3. Keep `main` as the default branch.
-
-## Deploy On Streamlit Community Cloud
-
-Official deployment docs:
-
-- [Deploy your app on Community Cloud](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy)
-
-Recommended settings:
-
-1. Sign in at [share.streamlit.io](https://share.streamlit.io/) with GitHub.
-2. Click `Create app`.
-3. Select your new GitHub repository.
-4. Branch: `main`
-5. File path: `streamlit_app.py`
-6. In `Advanced settings`, use Python `3.12` unless you need another supported version.
-7. Deploy.
+- Repository: `vince-npec/psi`
+- Branch: `main`
+- Main file: `streamlit_app.py`
+- Python: `3.12`
 
 ## Notes
 
-- The app supports `Auto`, `Potato / Soybean (2x2)`, and `Arabidopsis (4x5)` tray layouts.
-- `Universal / Custom Grid` lets you analyze arbitrary layouts such as `1x1`, `1x2`, `2x1`, `3x4`, or `5x5`, and pair them with `Auto`, `Rectangle tray`, `Circular pot / chamber`, or `Full image` container geometry.
-- Circular container mode includes per-image center-shift and size controls so users can manually move or enlarge the circle mask when auto-detection is slightly off.
-- The deployed Community Cloud app is browser-upload only. Users can upload one image, a batch of images, or one or more `.zip` archives directly in the web UI.
-- Each uploaded image can keep the default tray long side, use its own per-image tray-size override, or provide a direct `pixels per cm` override when no blue tray is visible.
-- The app can return a single downloadable results zip containing combined CSVs, per-image CSVs, original images, overlays, and mask outputs.
-- Invalid or non-image items inside uploads are skipped automatically so one bad file does not stop a batch run.
-- Physical traits are normalized from the tray long side, defaulting to `33 cm`.
+- ZIP uploads are supported directly in the browser.
+- Invalid files inside ZIP archives are skipped instead of crashing the batch.
+- Full results ZIPs are prepared on demand to keep memory use lower on Streamlit Community Cloud.

@@ -14,9 +14,9 @@ import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
 try:
+    from . import tray_analyzer
+except ImportError:  # pragma: no cover - direct script execution fallback
     import tray_analyzer
-except ImportError:  # pragma: no cover - packaged execution fallback
-    import potato_leaf_dashboard.tray_analyzer as tray_analyzer
 
 tray_analyzer.MAX_PLANT_ANALYSIS_DIM = max(int(getattr(tray_analyzer, "MAX_PLANT_ANALYSIS_DIM", 0) or 0), 4000)
 analyze_tray_image = tray_analyzer.analyze_tray_image
@@ -26,8 +26,14 @@ CONTAINER_MODE_OPTIONS = tray_analyzer.get_container_mode_options()
 CONTAINER_MODE_LABELS = {key: label for key, label in CONTAINER_MODE_OPTIONS}
 DEFAULT_TRAY_PROFILE_KEY = getattr(tray_analyzer, "AUTO_TRAY_PROFILE_KEY", TRAY_PROFILE_OPTIONS[0][0])
 CUSTOM_TRAY_PROFILE_KEY = getattr(tray_analyzer, "CUSTOM_TRAY_PROFILE_KEY", "custom")
+SEEDLINGS_PROFILE_KEY = getattr(tray_analyzer, "SEEDLINGS_PROFILE_KEY", "seedlings")
 DEFAULT_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_AUTO", "auto")
 DEFAULT_TRAY_LONG_SIDE_CM = float(getattr(tray_analyzer, "TRAY_LONG_SIDE_CM", 33.0))
+ANALYSIS_KIND_SEEDLINGS = getattr(tray_analyzer, "ANALYSIS_KIND_SEEDLINGS", "seedlings")
+FULL_IMAGE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_FULL_IMAGE", "full_image")
+
+SEEDLING_WORKFLOW_SINGLE = "single"
+SEEDLING_WORKFLOW_LINKED = "linked_multiview"
 
 
 st.set_page_config(
@@ -101,6 +107,24 @@ def _resize_for_preview(image_rgb: np.ndarray, max_edge: int = MAX_PREVIEW_EDGE)
 
 def _csv_bytes(df) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
+
+
+def _numeric_series_sum(df: pd.DataFrame, column: str) -> float | None:
+    if column not in df.columns:
+        return None
+    series = pd.to_numeric(df[column], errors="coerce")
+    if series.notna().sum() == 0:
+        return None
+    return float(series.fillna(0).sum())
+
+
+def _numeric_series_mean(df: pd.DataFrame, column: str) -> float | None:
+    if column not in df.columns:
+        return None
+    series = pd.to_numeric(df[column], errors="coerce")
+    if series.notna().sum() == 0:
+        return None
+    return float(series.dropna().mean())
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -345,6 +369,11 @@ def _build_mask_assets(result) -> dict[str, np.ndarray]:
     canopy_mask = np.zeros((image_h, image_w), dtype=np.uint8)
     plant_label_mask = np.zeros((image_h, image_w), dtype=np.uint8)
     leaf_label_mask = np.zeros((image_h, image_w), dtype=np.uint16)
+    shoot_mask = np.zeros((image_h, image_w), dtype=np.uint8)
+    root_mask = np.zeros((image_h, image_w), dtype=np.uint8)
+    primary_root_mask = np.zeros((image_h, image_w), dtype=np.uint8)
+    lateral_root_mask = np.zeros((image_h, image_w), dtype=np.uint8)
+    root_skeleton_mask = np.zeros((image_h, image_w), dtype=np.uint8)
     next_leaf_offset = 0
 
     for plant_idx, plant_result in enumerate(result.plant_results, start=1):
@@ -352,6 +381,16 @@ def _build_mask_assets(result) -> dict[str, np.ndarray]:
         crop_canopy = plant_result.mask > 0
         canopy_mask[y0:y1, x0:x1][crop_canopy] = 255
         plant_label_mask[y0:y1, x0:x1][crop_canopy] = plant_idx
+        if plant_result.shoot_mask is not None:
+            shoot_mask[y0:y1, x0:x1][plant_result.shoot_mask > 0] = 255
+        if plant_result.root_mask is not None:
+            root_mask[y0:y1, x0:x1][plant_result.root_mask > 0] = 255
+        if plant_result.primary_root_mask is not None:
+            primary_root_mask[y0:y1, x0:x1][plant_result.primary_root_mask > 0] = 255
+        if plant_result.lateral_root_mask is not None:
+            lateral_root_mask[y0:y1, x0:x1][plant_result.lateral_root_mask > 0] = 255
+        if plant_result.root_skeleton_mask is not None:
+            root_skeleton_mask[y0:y1, x0:x1][plant_result.root_skeleton_mask > 0] = 255
 
         crop_leaf_map = plant_result.leaf_label_map.astype(np.uint16)
         if np.any(crop_leaf_map > 0):
@@ -360,13 +399,24 @@ def _build_mask_assets(result) -> dict[str, np.ndarray]:
             crop_target[active] = crop_leaf_map[active] + next_leaf_offset
             next_leaf_offset += int(np.max(crop_leaf_map))
 
-    return {
+    mask_assets = {
         "canopy_mask": canopy_mask,
         "plant_label_mask": plant_label_mask,
         "leaf_label_mask": leaf_label_mask,
         "plant_color_mask": _colorize_label_map(plant_label_mask),
         "leaf_color_mask": _colorize_label_map(leaf_label_mask),
     }
+    if result.analysis_kind == ANALYSIS_KIND_SEEDLINGS or np.any(root_mask > 0):
+        mask_assets.update(
+            {
+                "shoot_mask": shoot_mask if np.any(shoot_mask > 0) else canopy_mask.copy(),
+                "root_mask": root_mask,
+                "primary_root_mask": primary_root_mask,
+                "lateral_root_mask": lateral_root_mask,
+                "root_skeleton_mask": root_skeleton_mask,
+            }
+        )
+    return mask_assets
 
 
 def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
@@ -398,6 +448,25 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
             zf.writestr(f"masks/{export_stem}_leaf_labels.png", _png_bytes_from_array(mask_assets["leaf_label_mask"]))
             zf.writestr(f"masks/{export_stem}_plant_color_mask.png", _png_bytes_from_array(mask_assets["plant_color_mask"]))
             zf.writestr(f"masks/{export_stem}_leaf_color_mask.png", _png_bytes_from_array(mask_assets["leaf_color_mask"]))
+            if "shoot_mask" in mask_assets:
+                zf.writestr(f"masks/{export_stem}_shoot_mask.png", _png_bytes_from_array(mask_assets["shoot_mask"]))
+            if "root_mask" in mask_assets:
+                zf.writestr(f"masks/{export_stem}_root_mask.png", _png_bytes_from_array(mask_assets["root_mask"]))
+            if "primary_root_mask" in mask_assets:
+                zf.writestr(
+                    f"masks/{export_stem}_primary_root_mask.png",
+                    _png_bytes_from_array(mask_assets["primary_root_mask"]),
+                )
+            if "lateral_root_mask" in mask_assets:
+                zf.writestr(
+                    f"masks/{export_stem}_lateral_root_mask.png",
+                    _png_bytes_from_array(mask_assets["lateral_root_mask"]),
+                )
+            if "root_skeleton_mask" in mask_assets:
+                zf.writestr(
+                    f"masks/{export_stem}_root_skeleton_mask.png",
+                    _png_bytes_from_array(mask_assets["root_skeleton_mask"]),
+                )
 
             zf.writestr(
                 f"per_image_csv/{export_stem}_plant_summary.csv",
@@ -414,6 +483,7 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
                         f"Image: {record['name']}",
                         f"Source: {source_path}",
                         f"Tray Profile: {result.tray_profile_name}",
+                        f"Analysis Kind: {getattr(result, 'analysis_kind', '')}",
                         f"Container Source: {result.container_source}",
                         f"Circle X Shift (%): {round(float(result.circle_center_x_shift_ratio) * 100.0, 2)}",
                         f"Circle Y Shift (%): {round(float(result.circle_center_y_shift_ratio) * 100.0, 2)}",
@@ -533,30 +603,36 @@ def _build_batch_payload(
             leaf_df.insert(1, "Source Path", item["source_path"])
         leaf_frames.append(leaf_df)
 
-        image_rows.append(
-            {
-                "Image": item["name"],
-                "Source Path": item.get("source_path", ""),
-                "Tray Profile": result.tray_profile_name,
-                "Grid Rows": result.grid_rows,
-                "Grid Columns": result.grid_cols,
-                "Container Source": result.container_source,
-                "Circle X Shift (%)": round(float(result.circle_center_x_shift_ratio) * 100.0, 2),
-                "Circle Y Shift (%)": round(float(result.circle_center_y_shift_ratio) * 100.0, 2),
-                "Circle Size (%)": round(float(result.circle_radius_scale) * 100.0, 2),
-                "Scale Source": result.scale_source,
-                "Estimated Leaves": int(result.plant_summary_df["Estimated Leaves"].sum()),
-                "Total Canopy Area (px)": int(result.plant_summary_df["Canopy Area (px)"].sum()),
-                "Total Canopy Area (cm^2)": round(float(result.plant_summary_df["Canopy Area (cm^2)"].fillna(0).sum()), 4),
-                "Plants With Canopy": int((result.plant_summary_df["Canopy Area (px)"] > 0).sum()),
-                "Tray Long Side (px)": result.tray_long_side_px,
-                "Tray Long Side (cm)": result.tray_long_side_cm,
-                "Pixels Per Cm": result.pixels_per_cm,
-                "Pixels Per Cm Override": result.pixels_per_cm_override,
-                "Mm Per Pixel": result.mm_per_pixel,
-                "Segmentation": result.segmentation_source,
-            }
-        )
+        image_row = {
+            "Image": item["name"],
+            "Source Path": item.get("source_path", ""),
+            "Tray Profile": result.tray_profile_name,
+            "Analysis Kind": getattr(result, "analysis_kind", ""),
+            "Grid Rows": result.grid_rows,
+            "Grid Columns": result.grid_cols,
+            "Container Source": result.container_source,
+            "Circle X Shift (%)": round(float(result.circle_center_x_shift_ratio) * 100.0, 2),
+            "Circle Y Shift (%)": round(float(result.circle_center_y_shift_ratio) * 100.0, 2),
+            "Circle Size (%)": round(float(result.circle_radius_scale) * 100.0, 2),
+            "Scale Source": result.scale_source,
+            "Estimated Leaves": int(result.plant_summary_df["Estimated Leaves"].sum()),
+            "Total Canopy Area (px)": int(result.plant_summary_df["Canopy Area (px)"].sum()),
+            "Total Canopy Area (cm^2)": round(float(result.plant_summary_df["Canopy Area (cm^2)"].fillna(0).sum()), 4),
+            "Plants With Canopy": int((result.plant_summary_df["Canopy Area (px)"] > 0).sum()),
+            "Tray Long Side (px)": result.tray_long_side_px,
+            "Tray Long Side (cm)": result.tray_long_side_cm,
+            "Pixels Per Cm": result.pixels_per_cm,
+            "Pixels Per Cm Override": result.pixels_per_cm_override,
+            "Mm Per Pixel": result.mm_per_pixel,
+            "Segmentation": result.segmentation_source,
+        }
+        if "Total Root Length (cm)" in result.plant_summary_df.columns:
+            image_row["Total Root Length (cm)"] = round(float(result.plant_summary_df["Total Root Length (cm)"].fillna(0).sum()), 4)
+        if "Root Area (cm^2)" in result.plant_summary_df.columns:
+            image_row["Total Root Area (cm^2)"] = round(float(result.plant_summary_df["Root Area (cm^2)"].fillna(0).sum()), 4)
+        if "Lateral Root Count" in result.plant_summary_df.columns:
+            image_row["Total Lateral Root Count"] = int(result.plant_summary_df["Lateral Root Count"].fillna(0).sum())
+        image_rows.append(image_row)
 
     image_summary_df = pd.DataFrame(image_rows)
     plant_summary_df = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
@@ -610,8 +686,776 @@ def _write_batch_outputs(output_dir_str: str, batch_payload: dict[str, Any]) -> 
     return written_paths
 
 
+def _collect_uploaded_items(
+    uploaded_files: list[Any] | None,
+    uploaded_archives: list[Any] | None,
+    image_label: str,
+) -> tuple[list[dict[str, Any]], int, int]:
+    file_items: list[dict[str, Any]] = []
+    for uploaded_file in uploaded_files or []:
+        file_items.append(
+            {
+                "name": uploaded_file.name,
+                "bytes": uploaded_file.getvalue(),
+                "source_path": "",
+                "kind": "direct",
+            }
+        )
+
+    zip_image_count = 0
+    zip_archive_count = 0
+    for uploaded_archive in uploaded_archives or []:
+        archive_bytes = uploaded_archive.getvalue()
+        try:
+            archive_members = _discover_zip_image_members(archive_bytes)
+        except zipfile.BadZipFile:
+            st.warning(f"`{uploaded_archive.name}` is not a readable zip archive and was skipped from `{image_label}`.")
+            continue
+        if not archive_members:
+            st.warning(f"`{uploaded_archive.name}` did not contain any supported images for `{image_label}`.")
+            continue
+        zip_archive_count += 1
+        zip_image_count += len(archive_members)
+        for member in archive_members:
+            file_items.append(
+                {
+                    "name": member["name"],
+                    "kind": "zip_member",
+                    "archive_name": uploaded_archive.name,
+                    "archive_bytes": archive_bytes,
+                    "member_name": member["member_name"],
+                    "source_path": f"{uploaded_archive.name}::{member['member_name']}",
+                }
+            )
+
+    return file_items, zip_archive_count, zip_image_count
+
+
+def _resolve_manual_scale_calibration(pixels_per_cm_value: float | None) -> tuple[float | None, float | None, str]:
+    pixels_per_cm = _coerce_optional_pixels_per_cm(pixels_per_cm_value)
+    if pixels_per_cm is None:
+        return None, None, "Uncalibrated (manual pixels/cm not provided)"
+    return pixels_per_cm, round(10.0 / float(pixels_per_cm), 6), "Manual pixels/cm override"
+
+
+def _cluster_columns_1d(
+    x_values: np.ndarray,
+    cluster_count: int,
+    initial_centers: np.ndarray | None = None,
+) -> np.ndarray:
+    if cluster_count <= 0:
+        return np.zeros(0, dtype=np.float32)
+    xs = np.asarray(x_values, dtype=np.float32).reshape(-1)
+    if xs.size == 0:
+        return np.zeros(cluster_count, dtype=np.float32)
+
+    if initial_centers is not None and len(initial_centers) == cluster_count:
+        centers = np.asarray(initial_centers, dtype=np.float32).reshape(-1)
+    else:
+        quantiles = np.linspace(0.08, 0.92, cluster_count)
+        centers = np.quantile(xs, quantiles).astype(np.float32)
+
+    min_x = float(xs.min())
+    max_x = float(xs.max())
+    centers = np.clip(centers, min_x, max_x)
+
+    for _ in range(40):
+        distances = np.abs(xs[:, None] - centers[None, :])
+        labels = np.argmin(distances, axis=1)
+        new_centers = centers.copy()
+        for cluster_idx in range(cluster_count):
+            cluster_pixels = xs[labels == cluster_idx]
+            if cluster_pixels.size > 0:
+                new_centers[cluster_idx] = float(cluster_pixels.mean())
+        if np.allclose(new_centers, centers):
+            break
+        centers = new_centers
+
+    return np.sort(centers.astype(np.float32))
+
+
+def _extract_seedling_x_regions(
+    mask_u8: np.ndarray,
+    expected_seedling_count: int,
+    y_min: int | None = None,
+    y_max: int | None = None,
+    initial_centers: np.ndarray | None = None,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    if mask_u8.size == 0 or expected_seedling_count <= 0:
+        return [], np.zeros(0, dtype=np.float32)
+
+    filtered_mask = mask_u8.copy()
+    height, width = filtered_mask.shape[:2]
+    if y_min is not None and y_min > 0:
+        filtered_mask[: max(0, min(height, int(y_min))), :] = 0
+    if y_max is not None and y_max < height - 1:
+        filtered_mask[max(0, min(height, int(y_max) + 1)) :, :] = 0
+
+    ys, xs = np.where(filtered_mask > 0)
+    if xs.size == 0 or ys.size == 0:
+        return [], np.zeros(expected_seedling_count, dtype=np.float32)
+
+    centers = _cluster_columns_1d(xs, expected_seedling_count, initial_centers=initial_centers)
+    if centers.size == 0:
+        return [], np.zeros(expected_seedling_count, dtype=np.float32)
+
+    distances = np.abs(xs[:, None].astype(np.float32) - centers[None, :])
+    labels = np.argmin(distances, axis=1)
+    min_cluster_pixels = max(120, int(xs.size * 0.018 / max(1, expected_seedling_count)))
+    regions: list[dict[str, Any]] = []
+
+    for cluster_idx in range(expected_seedling_count):
+        selected = labels == cluster_idx
+        if int(np.count_nonzero(selected)) < min_cluster_pixels:
+            continue
+        cluster_xs = xs[selected]
+        cluster_ys = ys[selected]
+        cluster_mask_u8 = np.zeros_like(filtered_mask, dtype=np.uint8)
+        cluster_mask_u8[cluster_ys, cluster_xs] = 255
+        x0 = int(cluster_xs.min())
+        y0 = int(cluster_ys.min())
+        x1 = int(cluster_xs.max()) + 1
+        y1 = int(cluster_ys.max()) + 1
+        anchor_band = cluster_xs[cluster_ys >= (cluster_ys.max() - 4)]
+        anchor_x = int(np.median(anchor_band)) if anchor_band.size > 0 else int(round(float(cluster_xs.mean())))
+        anchor_y = int(cluster_ys.max())
+        regions.append(
+            {
+                "bbox": (x0, y0, x1, y1),
+                "mask_u8": cluster_mask_u8,
+                "anchor": (anchor_x, anchor_y),
+                "center_x": float(cluster_xs.mean()),
+                "center_y": float(cluster_ys.mean()),
+                "site_index": int(cluster_idx + 1),
+                "row_index": 0,
+                "col_index": int(cluster_idx),
+                "name": f"Seedling {cluster_idx + 1}",
+                "position": tray_analyzer._format_grid_position(0, cluster_idx, 1, expected_seedling_count),
+            }
+        )
+
+    center_ratios = (centers / float(max(1, width))).astype(np.float32)
+    return regions, center_ratios
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def _analyze_linked_seedling_top_view(
+    image_bytes: bytes,
+    expected_seedling_count: int,
+    pixels_per_cm_override: float | None,
+) -> dict[str, Any]:
+    image_rgb = np.array(_open_rgb_image(image_bytes))
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    shoot_mask_u8 = tray_analyzer._segment_seedling_shoot_mask(image_bgr)
+    regions, center_ratios = _extract_seedling_x_regions(
+        shoot_mask_u8,
+        expected_seedling_count=expected_seedling_count,
+    )
+    pixels_per_cm, mm_per_pixel, scale_source = _resolve_manual_scale_calibration(pixels_per_cm_override)
+    tray_profile = tray_analyzer.TrayProfile(
+        key="seedling_top_linked",
+        name="Seedling top view",
+        rows=1,
+        cols=max(1, expected_seedling_count),
+    )
+
+    overlay_bgr = image_bgr.copy()
+    plant_results = []
+    plant_rows: list[dict[str, Any]] = []
+    leaf_rows: list[dict[str, Any]] = []
+
+    for region_idx, region in enumerate(regions):
+        x0, y0, x1, y1 = region["bbox"]
+        pad_x = max(14, int(round((x1 - x0) * 0.08)))
+        pad_y = max(14, int(round((y1 - y0) * 0.08)))
+        crop_x0 = max(0, x0 - pad_x)
+        crop_y0 = max(0, y0 - pad_y)
+        crop_x1 = min(image_bgr.shape[1], x1 + pad_x)
+        crop_y1 = min(image_bgr.shape[0], y1 + pad_y)
+        crop_bgr = image_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
+        crop_mask_u8 = region["mask_u8"][crop_y0:crop_y1, crop_x0:crop_x1].copy()
+
+        leaf_label_map, leaf_count, canopy_area_px, min_leaf_area_px = tray_analyzer._estimate_leaf_instances(
+            crop_mask_u8,
+            crop_bgr,
+            expected_groups=1,
+        )
+        site = tray_analyzer.PlantRegion(
+            name=str(region["name"]),
+            position=str(region["position"]),
+            site_index=int(region["site_index"]),
+            row_index=0,
+            col_index=int(region["col_index"]),
+            bbox=(x0, y0, x1, y1),
+        )
+        plant_traits, plant_leaf_rows = tray_analyzer._compute_trait_rows(
+            crop_bgr=crop_bgr,
+            mask_u8=crop_mask_u8,
+            leaf_label_map=leaf_label_map,
+            site=site,
+            analysis_bbox=(crop_x0, crop_y0, crop_x1, crop_y1),
+            min_leaf_area_px=min_leaf_area_px,
+            tray_profile=tray_profile,
+            container_source="Linked seedling top view",
+            circle_center_x_shift_ratio=0.0,
+            circle_center_y_shift_ratio=0.0,
+            circle_radius_scale=1.0,
+            tray_long_side_cm=0.0,
+            tray_long_side_px=0.0,
+            pixels_per_cm=pixels_per_cm,
+            pixels_per_cm_override=pixels_per_cm,
+            mm_per_pixel=mm_per_pixel,
+            scale_source=scale_source,
+        )
+        plant_traits["Analysis Kind"] = "seedling_top_view"
+        plant_traits["View"] = "Top view shoots"
+        for leaf_row in plant_leaf_rows:
+            leaf_row["Analysis Kind"] = "seedling_top_view"
+            leaf_row["View"] = "Top view shoots"
+
+        plant_result = tray_analyzer.PlantLeafResult(
+            name=site.name,
+            position=site.position,
+            bbox=(crop_x0, crop_y0, crop_x1, crop_y1),
+            site_bbox=(x0, y0, x1, y1),
+            leaf_count=int(leaf_count),
+            canopy_area_px=int(canopy_area_px),
+            min_leaf_area_px=int(min_leaf_area_px),
+            mask=crop_mask_u8,
+            leaf_label_map=leaf_label_map,
+            plant_traits=plant_traits,
+            leaf_traits=plant_leaf_rows,
+            shoot_mask=crop_mask_u8,
+        )
+        plant_results.append(plant_result)
+        plant_rows.append(plant_traits)
+        leaf_rows.extend(plant_leaf_rows)
+        tray_analyzer._draw_region_overlay(
+            overlay_bgr,
+            plant_result,
+            color=tray_analyzer._plant_color_bgr(region_idx, max(1, expected_seedling_count)),
+        )
+
+    plant_summary_df = pd.DataFrame(plant_rows)
+    leaf_detail_df = pd.DataFrame(leaf_rows)
+    counts_columns = ["Plant", "Position", "Estimated Leaves", "Canopy Area (cm^2)"]
+    counts_df = plant_summary_df[[column for column in counts_columns if column in plant_summary_df.columns]].copy()
+
+    return {
+        "image_shape": tuple(int(v) for v in image_rgb.shape[:2]),
+        "overlay_rgb": cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB),
+        "plant_summary_df": plant_summary_df,
+        "leaf_detail_df": leaf_detail_df,
+        "counts_df": counts_df,
+        "shoot_mask_u8": shoot_mask_u8,
+        "pixels_per_cm": pixels_per_cm,
+        "pixels_per_cm_override": pixels_per_cm,
+        "mm_per_pixel": mm_per_pixel,
+        "scale_source": scale_source,
+        "center_ratios": tuple(float(value) for value in center_ratios.tolist()),
+        "detected_seedling_count": int(len(plant_rows)),
+    }
+
+
+def _detect_side_view_surface_y(image_bgr: np.ndarray) -> int:
+    if image_bgr.size == 0:
+        return 0
+
+    working_bgr, scale = tray_analyzer._downscale_for_analysis(image_bgr, 1600)
+    gray = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    grad_y = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
+    row_score = np.mean(np.abs(grad_y), axis=1)
+    dark_threshold = float(np.percentile(gray, 45))
+    dark_fraction = np.mean(gray < dark_threshold, axis=1)
+    row_score = row_score * (0.55 + (0.45 * dark_fraction))
+    search_start = int(row_score.size * 0.25)
+    search_end = max(search_start + 1, int(row_score.size * 0.75))
+    best_row = search_start + int(np.argmax(row_score[search_start:search_end]))
+    if scale == 1.0:
+        return int(best_row)
+    return int(round(float(best_row) / float(scale)))
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def _analyze_linked_seedling_side_view(
+    image_bytes: bytes,
+    expected_seedling_count: int,
+    pixels_per_cm_override: float | None,
+    initial_center_ratios: tuple[float, ...] = (),
+) -> dict[str, Any]:
+    image_rgb = np.array(_open_rgb_image(image_bytes))
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    shoot_mask_u8 = tray_analyzer._segment_seedling_shoot_mask(image_bgr)
+    surface_y = _detect_side_view_surface_y(image_bgr)
+    expected_centers = None
+    if initial_center_ratios and len(initial_center_ratios) == expected_seedling_count:
+        expected_centers = np.asarray(initial_center_ratios, dtype=np.float32) * float(image_bgr.shape[1])
+    regions, center_ratios = _extract_seedling_x_regions(
+        shoot_mask_u8,
+        expected_seedling_count=expected_seedling_count,
+        y_min=int(surface_y * 0.7),
+        y_max=min(image_bgr.shape[0] - 1, surface_y + max(40, int(round(image_bgr.shape[0] * 0.03)))),
+        initial_centers=expected_centers,
+    )
+    pixels_per_cm, mm_per_pixel, scale_source = _resolve_manual_scale_calibration(pixels_per_cm_override)
+
+    overlay_bgr = image_bgr.copy()
+    cv2.line(
+        overlay_bgr,
+        (0, int(surface_y)),
+        (overlay_bgr.shape[1] - 1, int(surface_y)),
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    summary_rows: list[dict[str, Any]] = []
+    for region_idx, region in enumerate(regions):
+        region_mask_u8 = region["mask_u8"]
+        ys, xs = np.where(region_mask_u8 > 0)
+        if xs.size == 0 or ys.size == 0:
+            continue
+
+        top_y = int(round(float(np.quantile(ys, 0.03))))
+        x0, _, x1, _ = region["bbox"]
+        visible_height_px = max(0.0, float(surface_y - top_y))
+        visible_width_px = float(max(0, x1 - x0))
+        visible_area_px = float(xs.size)
+        center_x = int(round(float(xs.mean())))
+        mask_bool = region_mask_u8 > 0
+        color_stats = tray_analyzer._masked_color_stats(image_bgr, mask_bool)
+
+        color = tray_analyzer._plant_color_bgr(region_idx, max(1, expected_seedling_count))
+        overlay_layer = np.zeros_like(overlay_bgr)
+        overlay_layer[:] = color
+        overlay_bgr[mask_bool] = cv2.addWeighted(overlay_bgr[mask_bool], 0.72, overlay_layer[mask_bool], 0.28, 0)
+        cv2.rectangle(overlay_bgr, (int(x0), int(top_y)), (int(x1), int(surface_y)), color, 2)
+        cv2.line(overlay_bgr, (center_x, int(surface_y)), (center_x, int(top_y)), color, 3, cv2.LINE_AA)
+        cv2.circle(overlay_bgr, (center_x, int(top_y)), 6, color, -1)
+        cv2.circle(overlay_bgr, (center_x, int(surface_y)), 6, color, -1)
+        height_label = (
+            f"{tray_analyzer._length_px_to_cm(visible_height_px, pixels_per_cm):.2f} cm"
+            if pixels_per_cm is not None
+            else f"{int(round(visible_height_px))} px"
+        )
+        caption = f"{region['name']}: {height_label}"
+        caption_x = max(12, int(x0))
+        caption_y = max(26, int(top_y) - 12)
+        (caption_w, _), _ = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+        cv2.rectangle(overlay_bgr, (caption_x - 8, caption_y - 18), (caption_x + caption_w + 10, caption_y + 8), (18, 18, 18), -1)
+        cv2.putText(overlay_bgr, caption, (caption_x, caption_y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2, cv2.LINE_AA)
+
+        summary_rows.append(
+            {
+                "Plant": str(region["name"]),
+                "Position": str(region["position"]),
+                "Seedling Index": int(region["site_index"]),
+                "Grid Row": 1,
+                "Grid Column": int(region["col_index"] + 1),
+                "View": "Side view height",
+                "Scale Source": scale_source,
+                "Pixels Per Cm": pixels_per_cm,
+                "Pixels Per Cm Override": pixels_per_cm,
+                "Mm Per Pixel": mm_per_pixel,
+                "Surface Y": int(surface_y),
+                "Top Y": int(top_y),
+                "Center X": int(center_x),
+                "Visible Shoot Area (px)": int(round(visible_area_px)),
+                "Visible Shoot Area (cm^2)": tray_analyzer._area_px_to_cm2(visible_area_px, pixels_per_cm),
+                "Visible Shoot Width (px)": int(round(visible_width_px)),
+                "Visible Shoot Width (cm)": tray_analyzer._length_px_to_cm(visible_width_px, pixels_per_cm),
+                "Visible Shoot Height (px)": tray_analyzer._round_or_none(visible_height_px, 2),
+                "Visible Shoot Height (cm)": tray_analyzer._length_px_to_cm(visible_height_px, pixels_per_cm),
+                "Mean R": color_stats["mean_r"],
+                "Mean G": color_stats["mean_g"],
+                "Mean B": color_stats["mean_b"],
+                "Mean H": color_stats["mean_h"],
+                "Mean S": color_stats["mean_s"],
+                "Mean V": color_stats["mean_v"],
+                "ExG Mean": color_stats["exg_mean"],
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+    counts_columns = ["Plant", "Position", "Visible Shoot Height (cm)"]
+    counts_df = summary_df[[column for column in counts_columns if column in summary_df.columns]].copy()
+
+    return {
+        "image_shape": tuple(int(v) for v in image_rgb.shape[:2]),
+        "overlay_rgb": cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB),
+        "summary_df": summary_df,
+        "counts_df": counts_df,
+        "shoot_mask_u8": shoot_mask_u8,
+        "surface_y": int(surface_y),
+        "pixels_per_cm": pixels_per_cm,
+        "pixels_per_cm_override": pixels_per_cm,
+        "mm_per_pixel": mm_per_pixel,
+        "scale_source": scale_source,
+        "center_ratios": tuple(float(value) for value in center_ratios.tolist()),
+        "detected_seedling_count": int(len(summary_rows)),
+    }
+
+
+def _build_linked_seedling_batch_payload(
+    top_items: list[dict[str, Any]],
+    side_items: list[dict[str, Any]],
+    flat_items: list[dict[str, Any]],
+    expected_seedling_count: int,
+    top_pixels_per_cm_override: float | None,
+    side_pixels_per_cm_override: float | None,
+    flat_pixels_per_cm_override: float | None,
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    experiment_rows: list[dict[str, Any]] = []
+    seedling_frames = []
+    top_leaf_frames = []
+    flat_leaf_frames = []
+    skipped_items: list[dict[str, str]] = []
+
+    experiment_count = min(len(top_items), len(side_items), len(flat_items))
+    for experiment_idx in range(experiment_count):
+        top_item = top_items[experiment_idx]
+        side_item = side_items[experiment_idx]
+        flat_item = flat_items[experiment_idx]
+        experiment_name = f"Experiment {experiment_idx + 1}"
+
+        try:
+            top_result = _analyze_linked_seedling_top_view(
+                _get_item_bytes(top_item),
+                expected_seedling_count=expected_seedling_count,
+                pixels_per_cm_override=top_pixels_per_cm_override,
+            )
+            side_result = _analyze_linked_seedling_side_view(
+                _get_item_bytes(side_item),
+                expected_seedling_count=expected_seedling_count,
+                pixels_per_cm_override=side_pixels_per_cm_override,
+                initial_center_ratios=tuple(float(value) for value in top_result["center_ratios"]),
+            )
+            flat_result = _analyze_upload(
+                _get_item_bytes(flat_item),
+                SEEDLINGS_PROFILE_KEY,
+                DEFAULT_TRAY_LONG_SIDE_CM,
+                _coerce_optional_pixels_per_cm(flat_pixels_per_cm_override),
+                container_mode=FULL_IMAGE_CONTAINER_MODE,
+            )
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            skipped_items.append(
+                {
+                    "Experiment": experiment_name,
+                    "Reason": f"Skipped invalid image data ({type(exc).__name__}).",
+                    "Top Image": _item_display_path(top_item),
+                    "Side Image": _item_display_path(side_item),
+                    "Flat Image": _item_display_path(flat_item),
+                }
+            )
+            continue
+        except Exception as exc:
+            skipped_items.append(
+                {
+                    "Experiment": experiment_name,
+                    "Reason": f"Processing failed ({type(exc).__name__}).",
+                    "Top Image": _item_display_path(top_item),
+                    "Side Image": _item_display_path(side_item),
+                    "Flat Image": _item_display_path(flat_item),
+                }
+            )
+            continue
+
+        base_seedlings = pd.DataFrame(
+            {
+                "Seedling Index": list(range(1, int(expected_seedling_count) + 1)),
+                "Seedling": [f"Seedling {idx}" for idx in range(1, int(expected_seedling_count) + 1)],
+                "Expected Position": [
+                    tray_analyzer._format_grid_position(0, idx - 1, 1, int(expected_seedling_count))
+                    for idx in range(1, int(expected_seedling_count) + 1)
+                ],
+            }
+        )
+
+        top_merge_df = pd.DataFrame()
+        if not top_result["plant_summary_df"].empty:
+            top_merge_df = (
+                top_result["plant_summary_df"][
+                    [
+                        column
+                        for column in [
+                            "Site Index",
+                            "Estimated Leaves",
+                            "Canopy Area (px)",
+                            "Canopy Area (cm^2)",
+                            "Canopy BBox Width (px)",
+                            "Canopy BBox Width (cm)",
+                            "Canopy BBox Height (px)",
+                            "Canopy BBox Height (cm)",
+                            "Canopy Angle (deg)",
+                            "Mean R",
+                            "Mean G",
+                            "Mean B",
+                            "Mean H",
+                            "Mean S",
+                            "Mean V",
+                            "ExG Mean",
+                        ]
+                        if column in top_result["plant_summary_df"].columns
+                    ]
+                ]
+                .rename(
+                    columns={
+                        "Site Index": "Seedling Index",
+                        "Estimated Leaves": "Top Estimated Leaves",
+                        "Canopy Area (px)": "Top Shoot Area (px)",
+                        "Canopy Area (cm^2)": "Top Shoot Area (cm^2)",
+                        "Canopy BBox Width (px)": "Top Shoot Width (px)",
+                        "Canopy BBox Width (cm)": "Top Shoot Width (cm)",
+                        "Canopy BBox Height (px)": "Top Shoot Height Span (px)",
+                        "Canopy BBox Height (cm)": "Top Shoot Height Span (cm)",
+                        "Canopy Angle (deg)": "Top Shoot Angle (deg)",
+                        "Mean R": "Top Mean R",
+                        "Mean G": "Top Mean G",
+                        "Mean B": "Top Mean B",
+                        "Mean H": "Top Mean H",
+                        "Mean S": "Top Mean S",
+                        "Mean V": "Top Mean V",
+                        "ExG Mean": "Top ExG Mean",
+                    }
+                )
+            )
+
+        side_merge_df = pd.DataFrame()
+        if not side_result["summary_df"].empty:
+            side_merge_df = side_result["summary_df"][
+                [
+                    column
+                    for column in [
+                        "Seedling Index",
+                        "Visible Shoot Area (px)",
+                        "Visible Shoot Area (cm^2)",
+                        "Visible Shoot Width (px)",
+                        "Visible Shoot Width (cm)",
+                        "Visible Shoot Height (px)",
+                        "Visible Shoot Height (cm)",
+                        "Surface Y",
+                        "Top Y",
+                    ]
+                    if column in side_result["summary_df"].columns
+                ]
+            ].copy()
+
+        flat_merge_df = pd.DataFrame()
+        if not flat_result.plant_summary_df.empty:
+            flat_merge_df = (
+                flat_result.plant_summary_df[
+                    [
+                        column
+                        for column in [
+                            "Site Index",
+                            "Estimated Leaves",
+                            "Shoot Area (px)",
+                            "Shoot Area (cm^2)",
+                            "Shoot Perimeter (px)",
+                            "Shoot Perimeter (cm)",
+                            "Total Root Length (px)",
+                            "Total Root Length (cm)",
+                            "Primary Root Length (px)",
+                            "Primary Root Length (cm)",
+                            "Lateral Root Length (px)",
+                            "Lateral Root Length (cm)",
+                            "Lateral Root Count",
+                            "Root Area (px)",
+                            "Root Area (cm^2)",
+                            "Primary Root Area (px)",
+                            "Primary Root Area (cm^2)",
+                            "Lateral Root Area (px)",
+                            "Lateral Root Area (cm^2)",
+                            "Root Endpoint Count",
+                            "Root:Shoot Area Ratio",
+                            "Primary:Total Root Length Ratio",
+                        ]
+                        if column in flat_result.plant_summary_df.columns
+                    ]
+                ]
+                .rename(
+                    columns={
+                        "Site Index": "Seedling Index",
+                        "Estimated Leaves": "Flat Estimated Leaves",
+                        "Shoot Area (px)": "Flat Shoot Area (px)",
+                        "Shoot Area (cm^2)": "Flat Shoot Area (cm^2)",
+                        "Shoot Perimeter (px)": "Flat Shoot Perimeter (px)",
+                        "Shoot Perimeter (cm)": "Flat Shoot Perimeter (cm)",
+                    }
+                )
+            )
+
+        combined_df = base_seedlings.copy()
+        if not top_merge_df.empty:
+            combined_df = combined_df.merge(top_merge_df, on="Seedling Index", how="left")
+        if not side_merge_df.empty:
+            combined_df = combined_df.merge(side_merge_df, on="Seedling Index", how="left")
+        if not flat_merge_df.empty:
+            combined_df = combined_df.merge(flat_merge_df, on="Seedling Index", how="left")
+        combined_df.insert(0, "Experiment", experiment_name)
+        combined_df["Top Source"] = _item_display_path(top_item)
+        combined_df["Side Source"] = _item_display_path(side_item)
+        combined_df["Flat Source"] = _item_display_path(flat_item)
+
+        top_leaf_df = top_result["leaf_detail_df"].copy()
+        if not top_leaf_df.empty:
+            top_leaf_df.insert(0, "Experiment", experiment_name)
+            top_leaf_df.insert(1, "Source Path", _item_display_path(top_item))
+            top_leaf_frames.append(top_leaf_df)
+
+        flat_leaf_df = flat_result.leaf_detail_df.copy()
+        if not flat_leaf_df.empty:
+            flat_leaf_df.insert(0, "Experiment", experiment_name)
+            flat_leaf_df.insert(1, "Source Path", _item_display_path(flat_item))
+            flat_leaf_frames.append(flat_leaf_df)
+
+        seedling_frames.append(combined_df)
+        experiment_rows.append(
+            {
+                "Experiment": experiment_name,
+                "Top Image": str(top_item["name"]),
+                "Side Image": str(side_item["name"]),
+                "Flat Image": str(flat_item["name"]),
+                "Top Source": _item_display_path(top_item),
+                "Side Source": _item_display_path(side_item),
+                "Flat Source": _item_display_path(flat_item),
+                "Seedlings Requested": int(expected_seedling_count),
+                "Top Seedlings Detected": int(top_result["detected_seedling_count"]),
+                "Side Seedlings Detected": int(side_result["detected_seedling_count"]),
+                "Flat Seedlings Detected": int(len(flat_result.plant_summary_df)),
+                "Top Pixels Per Cm": top_result["pixels_per_cm"],
+                "Side Pixels Per Cm": side_result["pixels_per_cm"],
+                "Flat Pixels Per Cm": flat_result.pixels_per_cm,
+                "Top Shoot Area Sum (cm^2)": tray_analyzer._round_or_none(_numeric_series_sum(combined_df, "Top Shoot Area (cm^2)"), 4),
+                "Mean Visible Shoot Height (cm)": tray_analyzer._round_or_none(_numeric_series_mean(combined_df, "Visible Shoot Height (cm)"), 4),
+                "Total Root Length (cm)": tray_analyzer._round_or_none(_numeric_series_sum(combined_df, "Total Root Length (cm)"), 4),
+                "Total Lateral Root Count": int(round(_numeric_series_sum(combined_df, "Lateral Root Count") or 0.0)),
+            }
+        )
+        records.append(
+            {
+                "experiment_name": experiment_name,
+                "top_item": top_item,
+                "side_item": side_item,
+                "flat_item": flat_item,
+                "top_result": top_result,
+                "side_result": side_result,
+                "flat_result": flat_result,
+                "combined_df": combined_df,
+            }
+        )
+
+    experiment_summary_df = pd.DataFrame(experiment_rows)
+    seedling_summary_df = pd.concat(seedling_frames, ignore_index=True) if seedling_frames else pd.DataFrame()
+    top_leaf_detail_df = pd.concat(top_leaf_frames, ignore_index=True) if top_leaf_frames else pd.DataFrame()
+    flat_leaf_detail_df = pd.concat(flat_leaf_frames, ignore_index=True) if flat_leaf_frames else pd.DataFrame()
+    skipped_df = pd.DataFrame(skipped_items)
+
+    return {
+        "records": records,
+        "experiment_summary_df": experiment_summary_df,
+        "seedling_summary_df": seedling_summary_df,
+        "top_leaf_detail_df": top_leaf_detail_df,
+        "flat_leaf_detail_df": flat_leaf_detail_df,
+        "skipped_df": skipped_df,
+    }
+
+
+def _linked_seedling_results_zip_signature(batch_payload: dict[str, Any]) -> str:
+    digest = hashlib.sha1()
+    for key in ("experiment_summary_df", "seedling_summary_df", "top_leaf_detail_df", "flat_leaf_detail_df", "skipped_df"):
+        df = batch_payload.get(key)
+        digest.update(key.encode("utf-8"))
+        digest.update(_csv_bytes(df) if isinstance(df, pd.DataFrame) else b"")
+    for record in batch_payload.get("records", []):
+        digest.update(str(record.get("experiment_name", "")).encode("utf-8"))
+        digest.update(str(record["top_item"].get("source_path", "")).encode("utf-8"))
+        digest.update(str(record["side_item"].get("source_path", "")).encode("utf-8"))
+        digest.update(str(record["flat_item"].get("source_path", "")).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _build_linked_seedling_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("experiment_summary.csv", _csv_bytes(batch_payload["experiment_summary_df"]))
+        zf.writestr("seedling_multiview_summary.csv", _csv_bytes(batch_payload["seedling_summary_df"]))
+        zf.writestr("top_view_leaf_details.csv", _csv_bytes(batch_payload["top_leaf_detail_df"]))
+        zf.writestr("flat_view_leaf_details.csv", _csv_bytes(batch_payload["flat_leaf_detail_df"]))
+        if not batch_payload["skipped_df"].empty:
+            zf.writestr("skipped_items.csv", _csv_bytes(batch_payload["skipped_df"]))
+
+        for record in batch_payload["records"]:
+            experiment_slug = str(record["experiment_name"]).lower().replace(" ", "_")
+            top_item = record["top_item"]
+            side_item = record["side_item"]
+            flat_item = record["flat_item"]
+
+            zf.writestr(
+                f"originals/{experiment_slug}/top_{_safe_zip_path(str(top_item['name']))}",
+                _get_item_bytes(top_item),
+            )
+            zf.writestr(
+                f"originals/{experiment_slug}/side_{_safe_zip_path(str(side_item['name']))}",
+                _get_item_bytes(side_item),
+            )
+            zf.writestr(
+                f"originals/{experiment_slug}/flat_{_safe_zip_path(str(flat_item['name']))}",
+                _get_item_bytes(flat_item),
+            )
+
+            zf.writestr(
+                f"overlays/{experiment_slug}_top_overlay.png",
+                _png_bytes_from_array(record["top_result"]["overlay_rgb"]),
+            )
+            zf.writestr(
+                f"overlays/{experiment_slug}_side_overlay.png",
+                _png_bytes_from_array(record["side_result"]["overlay_rgb"]),
+            )
+            zf.writestr(
+                f"overlays/{experiment_slug}_flat_overlay.png",
+                _png_bytes_from_array(record["flat_result"].overlay_rgb),
+            )
+
+            zf.writestr(
+                f"masks/{experiment_slug}_top_shoot_mask.png",
+                _png_bytes_from_array(record["top_result"]["shoot_mask_u8"]),
+            )
+            zf.writestr(
+                f"masks/{experiment_slug}_side_shoot_mask.png",
+                _png_bytes_from_array(record["side_result"]["shoot_mask_u8"]),
+            )
+            flat_mask_assets = _build_mask_assets(record["flat_result"])
+            zf.writestr(
+                f"masks/{experiment_slug}_flat_shoot_mask.png",
+                _png_bytes_from_array(flat_mask_assets.get("shoot_mask", flat_mask_assets["canopy_mask"])),
+            )
+            zf.writestr(
+                f"masks/{experiment_slug}_flat_root_mask.png",
+                _png_bytes_from_array(flat_mask_assets.get("root_mask", np.zeros(record["flat_result"].image_shape, dtype=np.uint8))),
+            )
+            zf.writestr(
+                f"masks/{experiment_slug}_flat_primary_root_mask.png",
+                _png_bytes_from_array(flat_mask_assets.get("primary_root_mask", np.zeros(record["flat_result"].image_shape, dtype=np.uint8))),
+            )
+            zf.writestr(
+                f"masks/{experiment_slug}_flat_lateral_root_mask.png",
+                _png_bytes_from_array(flat_mask_assets.get("lateral_root_mask", np.zeros(record["flat_result"].image_shape, dtype=np.uint8))),
+            )
+
+            zf.writestr(
+                f"per_experiment_csv/{experiment_slug}_seedling_summary.csv",
+                _csv_bytes(record["combined_df"]),
+            )
+
+    return buffer.getvalue()
+
+
 def _render_record_detail(record: dict[str, Any]) -> None:
     result = record["result"]
+    is_seedling_analysis = getattr(result, "analysis_kind", "") == ANALYSIS_KIND_SEEDLINGS
     original_preview = _preview_from_bytes(_get_item_bytes(record["item"]), MAX_PREVIEW_EDGE)
     overlay_preview = _resize_for_preview(result.overlay_rgb, MAX_PREVIEW_EDGE)
 
@@ -627,8 +1471,17 @@ def _render_record_detail(record: dict[str, Any]) -> None:
         st.subheader("Quick Summary")
         st.dataframe(result.counts_df, hide_index=True, use_container_width=True)
         st.metric("Total estimated leaves", int(result.plant_summary_df["Estimated Leaves"].sum()))
-        st.metric("Total canopy area (cm^2)", round(float(result.plant_summary_df["Canopy Area (cm^2)"].fillna(0).sum()), 2))
-        st.metric("Pixels / cm", result.pixels_per_cm if result.pixels_per_cm is not None else "n/a")
+        if is_seedling_analysis and "Total Root Length (cm)" in result.plant_summary_df.columns:
+            st.metric(
+                "Total root length (cm)",
+                round(float(result.plant_summary_df["Total Root Length (cm)"].fillna(0).sum()), 2),
+            )
+        else:
+            st.metric("Total canopy area (cm^2)", round(float(result.plant_summary_df["Canopy Area (cm^2)"].fillna(0).sum()), 2))
+        if is_seedling_analysis and "Lateral Root Count" in result.plant_summary_df.columns:
+            st.metric("Total lateral roots", int(result.plant_summary_df["Lateral Root Count"].fillna(0).sum()))
+        else:
+            st.metric("Pixels / cm", result.pixels_per_cm if result.pixels_per_cm is not None else "n/a")
         st.caption(
             f"Layout: {result.tray_profile_name} | Container: {result.container_source} | Scale: {result.scale_source} | Segmentation: {result.segmentation_source} | "
             f"Tray long side: {result.tray_long_side_cm:.1f} cm = {result.tray_long_side_px:.1f} px"
@@ -660,11 +1513,266 @@ def _render_record_detail(record: dict[str, Any]) -> None:
             key=f"single_leaf_{record['export_stem']}",
         )
 
-    st.subheader("Plant Summary Traits")
+    st.subheader("Seedling Summary Traits" if is_seedling_analysis else "Plant Summary Traits")
     st.dataframe(result.plant_summary_df, hide_index=True, use_container_width=True)
 
-    st.subheader("Per-Leaf Traits")
+    st.subheader("Per-Shoot-Leaf Traits" if is_seedling_analysis else "Per-Leaf Traits")
     st.dataframe(result.leaf_detail_df, hide_index=True, use_container_width=True, height=420)
+
+
+def _render_linked_seedling_experiment_detail(record: dict[str, Any]) -> None:
+    top_original = _preview_from_bytes(_get_item_bytes(record["top_item"]), MAX_PREVIEW_EDGE)
+    side_original = _preview_from_bytes(_get_item_bytes(record["side_item"]), MAX_PREVIEW_EDGE)
+    flat_original = _preview_from_bytes(_get_item_bytes(record["flat_item"]), MAX_PREVIEW_EDGE)
+    top_overlay = _resize_for_preview(record["top_result"]["overlay_rgb"], MAX_PREVIEW_EDGE)
+    side_overlay = _resize_for_preview(record["side_result"]["overlay_rgb"], MAX_PREVIEW_EDGE)
+    flat_overlay = _resize_for_preview(record["flat_result"].overlay_rgb, MAX_PREVIEW_EDGE)
+
+    overlay_tab, original_tab = st.tabs(["Overlays", "Originals"])
+    with overlay_tab:
+        overlay_cols = st.columns(3)
+        overlay_cols[0].image(top_overlay, caption=f"Top view overlay: {record['top_item']['name']}", use_container_width=True)
+        overlay_cols[1].image(side_overlay, caption=f"Side view overlay: {record['side_item']['name']}", use_container_width=True)
+        overlay_cols[2].image(flat_overlay, caption=f"Flat roots+shoots overlay: {record['flat_item']['name']}", use_container_width=True)
+    with original_tab:
+        original_cols = st.columns(3)
+        original_cols[0].image(top_original, caption=f"Top view original: {record['top_item']['name']}", use_container_width=True)
+        original_cols[1].image(side_original, caption=f"Side view original: {record['side_item']['name']}", use_container_width=True)
+        original_cols[2].image(flat_original, caption=f"Flat roots+shoots original: {record['flat_item']['name']}", use_container_width=True)
+
+    summary_cols = st.columns(4)
+    combined_df = record["combined_df"]
+    summary_cols[0].metric("Seedlings linked", int(combined_df["Seedling Index"].nunique()))
+    top_area_sum_cm2 = _numeric_series_sum(combined_df, "Top Shoot Area (cm^2)")
+    mean_visible_height_cm = _numeric_series_mean(combined_df, "Visible Shoot Height (cm)")
+    total_root_length_cm = _numeric_series_sum(combined_df, "Total Root Length (cm)")
+    summary_cols[1].metric("Top shoot area (cm^2)", "n/a" if top_area_sum_cm2 is None else round(top_area_sum_cm2, 2))
+    summary_cols[2].metric("Mean visible height (cm)", "n/a" if mean_visible_height_cm is None else round(mean_visible_height_cm, 2))
+    summary_cols[3].metric("Total root length (cm)", "n/a" if total_root_length_cm is None else round(total_root_length_cm, 2))
+
+    st.subheader("Linked Seedling Summary")
+    st.dataframe(combined_df, hide_index=True, use_container_width=True)
+
+    with st.expander("Top-View Leaf Detail Table", expanded=False):
+        st.dataframe(record["top_result"]["leaf_detail_df"], hide_index=True, use_container_width=True, height=360)
+
+    with st.expander("Flat Root + Shoot Leaf Detail Table", expanded=False):
+        st.dataframe(record["flat_result"].leaf_detail_df, hide_index=True, use_container_width=True, height=360)
+
+
+def _render_linked_seedling_workflow() -> None:
+    st.subheader("Linked Seedling Experiment")
+    st.caption(
+        "Upload the `top view shoots`, `side view shoot height`, and `flat roots + shoots` images separately. "
+        "Experiments are paired by upload order and seedlings are linked left-to-right across the three modalities."
+    )
+
+    settings_cols = st.columns([0.9, 0.7, 0.7, 0.7])
+    expected_seedling_count = int(
+        settings_cols[0].number_input(
+            "Seedlings per experiment",
+            min_value=1,
+            max_value=64,
+            value=4,
+            step=1,
+        )
+    )
+    top_pixels_per_cm = float(
+        settings_cols[1].number_input(
+            "Top view pixels / cm",
+            min_value=0.0,
+            value=0.0,
+            step=0.1,
+            help="Optional manual calibration for the top-view images. Use `0` to leave top-view physical units uncalibrated.",
+        )
+    )
+    side_pixels_per_cm = float(
+        settings_cols[2].number_input(
+            "Side view pixels / cm",
+            min_value=0.0,
+            value=0.0,
+            step=0.1,
+            help="Optional manual calibration for visible shoot height in the side-view images. Use `0` to keep heights in pixels only.",
+        )
+    )
+    flat_pixels_per_cm = float(
+        settings_cols[3].number_input(
+            "Flat roots pixels / cm",
+            min_value=0.0,
+            value=100.0,
+            step=0.1,
+            help="Manual calibration for the flat roots+shoots images. This is usually the most important scale for root traits.",
+        )
+    )
+
+    top_uploads_col, side_uploads_col, flat_uploads_col = st.columns(3)
+    with top_uploads_col:
+        top_files = st.file_uploader(
+            "Top-view shoot images",
+            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+            accept_multiple_files=True,
+            key="linked_seedling_top_files",
+        )
+        top_archives = st.file_uploader(
+            "Top-view zip archives",
+            type=["zip"],
+            accept_multiple_files=True,
+            key="linked_seedling_top_archives",
+        )
+    with side_uploads_col:
+        side_files = st.file_uploader(
+            "Side-view height images",
+            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+            accept_multiple_files=True,
+            key="linked_seedling_side_files",
+        )
+        side_archives = st.file_uploader(
+            "Side-view zip archives",
+            type=["zip"],
+            accept_multiple_files=True,
+            key="linked_seedling_side_archives",
+        )
+    with flat_uploads_col:
+        flat_files = st.file_uploader(
+            "Flat roots + shoots images",
+            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+            accept_multiple_files=True,
+            key="linked_seedling_flat_files",
+        )
+        flat_archives = st.file_uploader(
+            "Flat roots + shoots zip archives",
+            type=["zip"],
+            accept_multiple_files=True,
+            key="linked_seedling_flat_archives",
+        )
+
+    top_items, top_zip_count, top_zip_images = _collect_uploaded_items(top_files, top_archives, "top-view shoot images")
+    side_items, side_zip_count, side_zip_images = _collect_uploaded_items(side_files, side_archives, "side-view height images")
+    flat_items, flat_zip_count, flat_zip_images = _collect_uploaded_items(flat_files, flat_archives, "flat roots + shoots images")
+
+    if top_zip_count or side_zip_count or flat_zip_count:
+        st.caption(
+            f"Zip inputs discovered: top {top_zip_images} image(s), side {side_zip_images} image(s), flat {flat_zip_images} image(s)."
+        )
+
+    if not top_items or not side_items or not flat_items:
+        st.info(
+            "Upload at least one image for each modality: top-view shoots, side-view height, and flat roots + shoots. "
+            "You can upload files directly or zip archives for any lane."
+        )
+        return
+
+    experiment_count = min(len(top_items), len(side_items), len(flat_items))
+    if len(top_items) != len(side_items) or len(top_items) != len(flat_items):
+        st.warning(
+            "The three modality lanes do not contain the same number of images. "
+            f"The workflow will analyze the first {experiment_count} paired experiment(s) by upload order."
+        )
+
+    with st.spinner(f"Analyzing {experiment_count} linked seedling experiment(s)..."):
+        batch_payload = _build_linked_seedling_batch_payload(
+            top_items=top_items[:experiment_count],
+            side_items=side_items[:experiment_count],
+            flat_items=flat_items[:experiment_count],
+            expected_seedling_count=expected_seedling_count,
+            top_pixels_per_cm_override=_coerce_optional_pixels_per_cm(top_pixels_per_cm),
+            side_pixels_per_cm_override=_coerce_optional_pixels_per_cm(side_pixels_per_cm),
+            flat_pixels_per_cm_override=_coerce_optional_pixels_per_cm(flat_pixels_per_cm),
+        )
+
+    results_zip_signature = _linked_seedling_results_zip_signature(batch_payload)
+    if st.session_state.get("prepared_linked_seedling_zip_signature") != results_zip_signature:
+        st.session_state.pop("prepared_linked_seedling_zip_bytes", None)
+        st.session_state["prepared_linked_seedling_zip_signature"] = results_zip_signature
+
+    skipped_df = batch_payload["skipped_df"]
+    if not skipped_df.empty:
+        st.warning(f"Skipped {len(skipped_df)} linked experiment(s) that could not be decoded or processed.")
+        with st.expander("Skipped linked experiments", expanded=False):
+            st.dataframe(skipped_df, hide_index=True, use_container_width=True)
+
+    if not batch_payload["records"]:
+        st.error("No linked seedling experiments could be analyzed from the uploaded images.")
+        return
+
+    experiment_summary_df = batch_payload["experiment_summary_df"]
+    seedling_summary_df = batch_payload["seedling_summary_df"]
+    top_leaf_detail_df = batch_payload["top_leaf_detail_df"]
+    flat_leaf_detail_df = batch_payload["flat_leaf_detail_df"]
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Experiments", int(len(batch_payload["records"])))
+    summary_cols[1].metric("Seedlings", int(seedling_summary_df["Seedling Index"].count()))
+    visible_height_sum_cm = _numeric_series_sum(seedling_summary_df, "Visible Shoot Height (cm)")
+    root_length_sum_cm = _numeric_series_sum(seedling_summary_df, "Total Root Length (cm)")
+    summary_cols[2].metric("Visible height sum (cm)", "n/a" if visible_height_sum_cm is None else round(visible_height_sum_cm, 2))
+    summary_cols[3].metric("Root length sum (cm)", "n/a" if root_length_sum_cm is None else round(root_length_sum_cm, 2))
+
+    export_cols = st.columns(5)
+    export_cols[0].download_button(
+        "Download Experiment CSV",
+        data=_csv_bytes(experiment_summary_df),
+        file_name="experiment_summary.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    export_cols[1].download_button(
+        "Download Seedling CSV",
+        data=_csv_bytes(seedling_summary_df),
+        file_name="seedling_multiview_summary.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    export_cols[2].download_button(
+        "Download Top Leaf CSV",
+        data=_csv_bytes(top_leaf_detail_df),
+        file_name="top_view_leaf_details.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    export_cols[3].download_button(
+        "Download Flat Leaf CSV",
+        data=_csv_bytes(flat_leaf_detail_df),
+        file_name="flat_view_leaf_details.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    prepared_zip_bytes = st.session_state.get("prepared_linked_seedling_zip_bytes")
+    if prepared_zip_bytes is None:
+        if export_cols[4].button("Prepare Linked ZIP", use_container_width=True):
+            with st.spinner("Preparing linked experiment ZIP..."):
+                st.session_state["prepared_linked_seedling_zip_bytes"] = _build_linked_seedling_results_bundle_bytes(batch_payload)
+            st.rerun()
+    else:
+        export_cols[4].download_button(
+            "Download Linked ZIP",
+            data=prepared_zip_bytes,
+            file_name="seedling_multiview_results.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+    st.caption(
+        "The linked results zip contains experiment-level CSVs, original images, overlays for the three modalities, "
+        "top-view masks, and flat root/shoot masks."
+    )
+
+    st.subheader("Experiment Summary")
+    st.dataframe(experiment_summary_df, hide_index=True, use_container_width=True)
+
+    experiment_labels = [record["experiment_name"] for record in batch_payload["records"]]
+    selected_experiment = st.selectbox("Experiment detail view", options=experiment_labels, index=0)
+    selected_record = next(record for record in batch_payload["records"] if record["experiment_name"] == selected_experiment)
+    _render_linked_seedling_experiment_detail(selected_record)
+
+    with st.expander("Combined Seedling Table", expanded=(len(batch_payload["records"]) == 1)):
+        st.dataframe(seedling_summary_df, hide_index=True, use_container_width=True, height=420)
+
+    with st.expander("Top-View Leaf Detail Table", expanded=False):
+        st.dataframe(top_leaf_detail_df, hide_index=True, use_container_width=True, height=360)
+
+    with st.expander("Flat Root + Shoot Leaf Detail Table", expanded=False):
+        st.dataframe(flat_leaf_detail_df, hide_index=True, use_container_width=True, height=360)
 
 
 def main() -> None:
@@ -673,8 +1781,8 @@ def main() -> None:
     with title_col:
         st.title("Plant Tray Phenotyping Dashboard")
         st.caption(
-            "Run potato, soybean, or Arabidopsis tray images, extract 2D plant and leaf traits, and export combined CSVs. "
-            "Physical measurements are normalized from the detected tray long side."
+            "Run tray, chamber, or seedling images, extract shoot and root traits, and export combined CSVs. "
+            "Physical measurements are normalized from the detected tray long side or your manual pixels/cm calibration."
         )
     with logo_col:
         if logo_data_uri is not None:
@@ -714,6 +1822,11 @@ def main() -> None:
     )
     if tray_profile_key == DEFAULT_TRAY_PROFILE_KEY:
         st.caption("Auto layout chooses between a 4-plant 2x2 tray and a 20-plant 4x5 Arabidopsis tray from the canopy pattern.")
+    if tray_profile_key == SEEDLINGS_PROFILE_KEY:
+        st.caption(
+            "Seedlings mode separates green shoots from roots and reports primary-root and lateral-root traits per seedling. "
+            "Use `Full image` for flat scans on dark backgrounds and `Pixels Per Cm Override` when there is no tray scale in the image."
+        )
     if tray_profile_key == CUSTOM_TRAY_PROFILE_KEY:
         custom_col_1, custom_col_2, custom_col_3, custom_col_4 = st.columns(4)
         custom_grid_rows = int(
@@ -763,6 +1876,25 @@ def main() -> None:
         custom_outer_pad_pct = None
         custom_site_pad_pct = None
 
+    if tray_profile_key == SEEDLINGS_PROFILE_KEY:
+        seedling_workflow_mode = st.selectbox(
+            "Seedling workflow",
+            options=[SEEDLING_WORKFLOW_SINGLE, SEEDLING_WORKFLOW_LINKED],
+            index=0,
+            format_func=lambda value: {
+                SEEDLING_WORKFLOW_SINGLE: "Single image or batch (current seedlings mode)",
+                SEEDLING_WORKFLOW_LINKED: "Linked experiment: top view + side view + flat roots",
+            }.get(value, value),
+        )
+        if seedling_workflow_mode == SEEDLING_WORKFLOW_LINKED:
+            _render_linked_seedling_workflow()
+            st.markdown("---")
+            st.markdown(
+                f"<div style='text-align:center; font-size:0.9rem; color:rgba(250,250,250,0.65);'>{FOOTER_TEXT}</div>",
+                unsafe_allow_html=True,
+            )
+            return
+
     uploaded_files = st.file_uploader(
         "Tray images",
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
@@ -805,7 +1937,7 @@ def main() -> None:
     if zip_archive_count > 0:
         st.caption(f"Discovered {zip_image_count} image(s) across {zip_archive_count} uploaded zip archive(s).")
     if not file_items:
-        st.info("Upload one or more top-down tray images or a zip archive of images to analyze them together.")
+        st.info("Upload one or more tray or seedling images, or a zip archive of images, to analyze them together.")
         return
 
     st.subheader("Per-Image Scale")
@@ -981,13 +2113,18 @@ def main() -> None:
         st.error("No valid tray images were available to analyze from the uploaded files.")
         return
 
-    summary_col_1, summary_col_2, summary_col_3 = st.columns(3)
+    has_root_summary = "Total Root Length (cm)" in image_summary_df.columns
+    summary_columns = st.columns(4 if has_root_summary else 3)
+    summary_col_1, summary_col_2, summary_col_3 = summary_columns[:3]
     with summary_col_1:
         st.metric("Images", int(len(batch_payload["records"])))
     with summary_col_2:
         st.metric("Total estimated leaves", int(image_summary_df["Estimated Leaves"].sum()))
     with summary_col_3:
         st.metric("Total canopy area (cm^2)", round(float(image_summary_df["Total Canopy Area (cm^2)"].sum()), 2))
+    if has_root_summary:
+        with summary_columns[3]:
+            st.metric("Total root length (cm)", round(float(image_summary_df["Total Root Length (cm)"].fillna(0).sum()), 2))
     with summary_col_1:
         if zip_archive_count > 0:
             st.caption(f"Zip inputs: {zip_archive_count}")
