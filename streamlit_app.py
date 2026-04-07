@@ -56,6 +56,10 @@ TOP_VIEW_ONNX_MODEL_PATH = APP_ROOT / "models" / "rgb2_only_hailo_rosette_v1.onn
 TOP_VIEW_ONNX_CONFIDENCE = 0.25
 TOP_VIEW_ONNX_IOU = 0.45
 TOP_VIEW_ONNX_MASK_THRESHOLD = 0.45
+FLAT_ROOT_ONNX_MODEL_PATH = APP_ROOT / "models" / "root_unet_ecotron.onnx"
+FLAT_ROOT_ONNX_MASK_THRESHOLD = 0.2
+FLAT_ROOT_ONNX_MIN_PIXELS = 180
+FLAT_ROOT_ONNX_SHOOT_BUFFER_PX = 13
 
 
 def _open_rgb_image(image_bytes: bytes) -> Image.Image:
@@ -83,6 +87,137 @@ def _load_top_view_onnx_model() -> dict[str, Any] | None:
         "input_h": input_h,
         "input_w": input_w,
     }
+
+
+@st.cache_resource(show_spinner=False)
+def _load_flat_root_onnx_model() -> dict[str, Any] | None:
+    if ort is None or not FLAT_ROOT_ONNX_MODEL_PATH.exists():
+        return None
+
+    session = ort.InferenceSession(
+        str(FLAT_ROOT_ONNX_MODEL_PATH),
+        providers=["CPUExecutionProvider"],
+    )
+    input_meta = session.get_inputs()[0]
+    input_shape = list(input_meta.shape)
+    channels_last = len(input_shape) >= 4 and isinstance(input_shape[-1], int) and int(input_shape[-1]) == 3
+    if channels_last:
+        input_h = int(input_shape[1]) if isinstance(input_shape[1], int) and int(input_shape[1]) > 0 else 256
+        input_w = int(input_shape[2]) if isinstance(input_shape[2], int) and int(input_shape[2]) > 0 else 256
+    else:
+        input_h = int(input_shape[2]) if len(input_shape) >= 4 and isinstance(input_shape[2], int) and int(input_shape[2]) > 0 else 256
+        input_w = int(input_shape[3]) if len(input_shape) >= 4 and isinstance(input_shape[3], int) and int(input_shape[3]) > 0 else 256
+
+    output_meta = session.get_outputs()[0]
+    output_shape = list(output_meta.shape)
+    output_channels_last = not (
+        len(output_shape) >= 4
+        and isinstance(output_shape[1], int)
+        and int(output_shape[1]) in (1, 2, 3, 4)
+    )
+    return {
+        "session": session,
+        "input_name": input_meta.name,
+        "input_h": input_h,
+        "input_w": input_w,
+        "channels_last": channels_last,
+        "output_channels_last": output_channels_last,
+    }
+
+
+def _normalize_segmentation_foreground_map(prediction: np.ndarray) -> np.ndarray:
+    if prediction.ndim != 3:
+        return np.zeros(prediction.shape[:2], dtype=np.float32)
+
+    if prediction.shape[-1] > 1:
+        channel_means = prediction.reshape(-1, prediction.shape[-1]).mean(axis=0)
+        foreground = prediction[..., int(np.argmin(channel_means))]
+    else:
+        foreground = prediction[..., 0]
+
+    foreground = np.asarray(foreground, dtype=np.float32)
+    min_value = float(foreground.min())
+    max_value = float(foreground.max())
+    if min_value < 0.0 or max_value > 1.0:
+        if max_value > min_value:
+            foreground = (foreground - min_value) / (max_value - min_value)
+        else:
+            foreground = np.zeros_like(foreground, dtype=np.float32)
+    return np.clip(foreground, 0.0, 1.0)
+
+
+def _build_seedling_stripe_bounds(
+    regions: list[dict[str, Any]],
+    image_width: int,
+    margin_px: int,
+) -> list[tuple[int, int]]:
+    if not regions:
+        return []
+
+    centers = [float(region["center_x"]) for region in regions]
+    boundaries = [0]
+    for region_idx in range(len(centers) - 1):
+        midpoint = int(round((centers[region_idx] + centers[region_idx + 1]) / 2.0))
+        boundaries.append(int(np.clip(midpoint, 0, max(0, image_width))))
+    boundaries.append(int(image_width))
+
+    stripe_bounds: list[tuple[int, int]] = []
+    for region_idx in range(len(regions)):
+        left = max(0, int(boundaries[region_idx]) - int(margin_px))
+        right = min(int(image_width), int(boundaries[region_idx + 1]) + int(margin_px))
+        if right <= left:
+            center_x = int(round(centers[region_idx]))
+            left = max(0, center_x - max(20, int(margin_px)))
+            right = min(int(image_width), center_x + max(21, int(margin_px) + 1))
+        stripe_bounds.append((left, right))
+    return stripe_bounds
+
+
+def _infer_flat_root_support_from_onnx(
+    crop_bgr: np.ndarray,
+    crop_shoot_mask_u8: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    model = _load_flat_root_onnx_model()
+    crop_h, crop_w = crop_bgr.shape[:2]
+    if model is None or crop_h <= 0 or crop_w <= 0:
+        return np.zeros((crop_h, crop_w), dtype=np.uint8), np.zeros((crop_h, crop_w), dtype=np.float32)
+
+    input_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    input_rgb = cv2.resize(input_rgb, (int(model["input_w"]), int(model["input_h"])), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+    if bool(model["channels_last"]):
+        input_tensor = input_rgb[None]
+    else:
+        input_tensor = np.transpose(input_rgb, (2, 0, 1))[None]
+
+    prediction = model["session"].run(None, {model["input_name"]: input_tensor})[0][0]
+    if not bool(model["output_channels_last"]):
+        prediction = np.transpose(prediction, (1, 2, 0))
+    foreground_prob = _normalize_segmentation_foreground_map(prediction)
+    foreground_prob = cv2.resize(foreground_prob.astype(np.float32), (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+    raw_mask_u8 = ((foreground_prob >= float(FLAT_ROOT_ONNX_MASK_THRESHOLD)).astype(np.uint8) * 255)
+
+    shoot_buffer = cv2.dilate(
+        crop_shoot_mask_u8,
+        np.ones((FLAT_ROOT_ONNX_SHOOT_BUFFER_PX, FLAT_ROOT_ONNX_SHOOT_BUFFER_PX), dtype=np.uint8),
+        iterations=1,
+    )
+    root_mask_u8 = cv2.bitwise_and(raw_mask_u8, cv2.bitwise_not(shoot_buffer))
+    foreground_prob = np.where(shoot_buffer > 0, 0.0, foreground_prob)
+
+    binary = (root_mask_u8 > 0).astype(np.uint8)
+    if int(np.count_nonzero(binary)) <= 0:
+        return np.zeros((crop_h, crop_w), dtype=np.uint8), foreground_prob.astype(np.float32)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    filtered_mask_u8 = np.zeros_like(root_mask_u8)
+    min_component_area_px = max(14, int(round((crop_h * crop_w) * 0.00012)))
+    for label_idx in range(1, num_labels):
+        area_px = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area_px < min_component_area_px:
+            continue
+        filtered_mask_u8[labels == label_idx] = 255
+
+    return filtered_mask_u8, foreground_prob.astype(np.float32)
 
 
 def _letterbox_image(image_bgr: np.ndarray, new_shape: tuple[int, int]) -> tuple[np.ndarray, float, tuple[float, float], tuple[int, int]]:
@@ -1473,6 +1608,227 @@ def _analyze_linked_seedling_side_view(
     }
 
 
+@st.cache_data(show_spinner=False, max_entries=24)
+def _analyze_linked_seedling_flat_view(
+    image_bytes: bytes,
+    expected_seedling_count: int,
+    pixels_per_cm_override: float | None,
+    initial_center_ratios: tuple[float, ...] = (),
+):
+    image_rgb = np.array(_open_rgb_image(image_bytes))
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    shoot_mask_u8 = tray_analyzer._segment_seedling_shoot_mask(image_bgr)
+    expected_centers = None
+    if initial_center_ratios and len(initial_center_ratios) == expected_seedling_count:
+        expected_centers = np.asarray(initial_center_ratios, dtype=np.float32) * float(image_bgr.shape[1])
+    regions, _ = _extract_seedling_component_regions(
+        shoot_mask_u8,
+        expected_seedling_count=expected_seedling_count,
+        initial_centers=expected_centers,
+    )
+    if len(regions) != expected_seedling_count:
+        regions, _ = _extract_seedling_x_regions(
+            shoot_mask_u8,
+            expected_seedling_count=expected_seedling_count,
+            initial_centers=expected_centers,
+        )
+
+    pixels_per_cm, mm_per_pixel, scale_source = _resolve_manual_scale_calibration(pixels_per_cm_override)
+    tray_profile = tray_analyzer.TrayProfile(
+        key="seedling_flat_linked",
+        name="Seedling flat view",
+        rows=1,
+        cols=max(1, expected_seedling_count),
+    )
+    image_h, image_w = image_bgr.shape[:2]
+    overlay_bgr = image_bgr.copy()
+    plant_results = []
+    plant_rows: list[dict[str, Any]] = []
+    leaf_rows: list[dict[str, Any]] = []
+    model_crop_count = 0
+    heuristic_fallback_count = 0
+    stripe_bounds = _build_seedling_stripe_bounds(
+        regions,
+        image_width=image_w,
+        margin_px=max(10, int(round(image_w * 0.015))),
+    )
+    for region_idx, region in enumerate(regions):
+        crop_x0, crop_x1 = stripe_bounds[region_idx]
+        crop_y0 = 0
+        crop_y1 = image_h
+        crop_bgr = image_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
+        crop_shoot_mask_u8 = shoot_mask_u8[crop_y0:crop_y1, crop_x0:crop_x1].copy()
+        anchor_local = (
+            int(region["anchor"][0] - crop_x0),
+            int(region["anchor"][1] - crop_y0),
+        )
+        shoot_bbox_global = region["bbox"]
+        shoot_bbox_local = (
+            int(shoot_bbox_global[0] - crop_x0),
+            int(shoot_bbox_global[1] - crop_y0),
+            int(shoot_bbox_global[2] - crop_x0),
+            int(shoot_bbox_global[3] - crop_y0),
+        )
+
+        heuristic_root_support_mask_u8 = tray_analyzer._segment_seedling_root_support_mask(
+            crop_bgr=crop_bgr,
+            crop_shoot_mask_u8=crop_shoot_mask_u8,
+            crop_container_mask_u8=np.full(crop_shoot_mask_u8.shape, 255, dtype=np.uint8),
+            anchor_local=anchor_local,
+            shoot_bbox_local=shoot_bbox_local,
+        )
+        model_root_mask_u8, model_root_prob = _infer_flat_root_support_from_onnx(
+            crop_bgr=crop_bgr,
+            crop_shoot_mask_u8=crop_shoot_mask_u8,
+        )
+        if int(np.count_nonzero(model_root_mask_u8)) >= int(FLAT_ROOT_ONNX_MIN_PIXELS):
+            model_crop_count += 1
+            model_extension_window_u8 = cv2.dilate(model_root_mask_u8, np.ones((31, 31), dtype=np.uint8), iterations=1)
+            guided_heuristic_mask_u8 = cv2.bitwise_and(heuristic_root_support_mask_u8, model_extension_window_u8)
+            root_support_mask_u8 = cv2.bitwise_or(model_root_mask_u8, guided_heuristic_mask_u8)
+        else:
+            heuristic_fallback_count += 1
+            root_support_mask_u8 = heuristic_root_support_mask_u8
+
+        heuristic_score_map = tray_analyzer._compute_seedling_primary_root_score_map(
+            crop_bgr=crop_bgr,
+            crop_shoot_mask_u8=crop_shoot_mask_u8,
+            crop_container_mask_u8=np.full(crop_shoot_mask_u8.shape, 255, dtype=np.uint8),
+            anchor_local=anchor_local,
+            shoot_bbox_local=shoot_bbox_local,
+        )
+        if model_root_prob.size > 0:
+            model_score_map = np.where(crop_shoot_mask_u8 > 0, 0.0, model_root_prob.astype(np.float32) * 100.0)
+            primary_root_score_map = np.maximum(model_score_map, heuristic_score_map.astype(np.float32) * 0.55)
+        else:
+            primary_root_score_map = heuristic_score_map
+
+        root_parts = tray_analyzer._classify_seedling_root_parts(
+            root_support_mask_u8,
+            anchor_local,
+            primary_root_score_map=primary_root_score_map,
+        )
+
+        leaf_label_map, leaf_count, canopy_area_px, min_leaf_area_px = tray_analyzer._estimate_leaf_instances(
+            crop_shoot_mask_u8,
+            crop_bgr,
+            expected_groups=1,
+        )
+        site = tray_analyzer.PlantRegion(
+            name=str(region["name"]),
+            position=str(region["position"]),
+            site_index=int(region["site_index"]),
+            row_index=0,
+            col_index=int(region["col_index"]),
+            bbox=tuple(int(value) for value in region["bbox"]),
+        )
+        analysis_bbox = (crop_x0, crop_y0, crop_x1, crop_y1)
+        plant_traits, plant_leaf_rows = tray_analyzer._compute_trait_rows(
+            crop_bgr=crop_bgr,
+            mask_u8=crop_shoot_mask_u8,
+            leaf_label_map=leaf_label_map,
+            site=site,
+            analysis_bbox=analysis_bbox,
+            min_leaf_area_px=min_leaf_area_px,
+            tray_profile=tray_profile,
+            container_source="Linked seedling flat view",
+            circle_center_x_shift_ratio=0.0,
+            circle_center_y_shift_ratio=0.0,
+            circle_radius_scale=1.0,
+            tray_long_side_cm=0.0,
+            tray_long_side_px=0.0,
+            pixels_per_cm=pixels_per_cm,
+            pixels_per_cm_override=pixels_per_cm_override,
+            mm_per_pixel=mm_per_pixel,
+            scale_source=scale_source,
+        )
+        plant_traits.update(
+            tray_analyzer._seedling_root_trait_columns(
+                root_parts=root_parts,
+                pixels_per_cm=pixels_per_cm,
+                shoot_area_px=float(plant_traits.get("Canopy Area (px)", 0) or 0.0),
+                anchor_global=(int(region["anchor"][0]), int(region["anchor"][1])),
+            )
+        )
+        plant_traits["Analysis Kind"] = ANALYSIS_KIND_SEEDLINGS
+        plant_traits["View"] = "Flat roots + shoots"
+        plant_traits["Shoot Area (px)"] = plant_traits.get("Canopy Area (px)")
+        plant_traits["Shoot Area (cm^2)"] = plant_traits.get("Canopy Area (cm^2)")
+        plant_traits["Shoot Perimeter (px)"] = plant_traits.get("Perimeter (px)")
+        plant_traits["Shoot Perimeter (cm)"] = plant_traits.get("Perimeter (cm)")
+        plant_traits["Shoot Solidity"] = plant_traits.get("Solidity")
+        plant_traits["Shoot Circularity"] = plant_traits.get("Circularity")
+        plant_traits["Shoot Aspect Ratio"] = plant_traits.get("Aspect Ratio")
+
+        for leaf_row in plant_leaf_rows:
+            leaf_row["Analysis Kind"] = ANALYSIS_KIND_SEEDLINGS
+            leaf_row["View"] = "Flat roots + shoots"
+            leaf_row["Organ"] = "Shoot leaf"
+
+        plant_result = tray_analyzer.PlantLeafResult(
+            name=site.name,
+            position=site.position,
+            bbox=analysis_bbox,
+            site_bbox=site.bbox,
+            leaf_count=int(leaf_count),
+            canopy_area_px=int(canopy_area_px),
+            min_leaf_area_px=int(min_leaf_area_px),
+            mask=crop_shoot_mask_u8,
+            leaf_label_map=leaf_label_map,
+            plant_traits=plant_traits,
+            leaf_traits=plant_leaf_rows,
+            shoot_mask=crop_shoot_mask_u8,
+            root_mask=root_parts["root_mask_u8"],
+            primary_root_mask=root_parts["primary_root_mask_u8"],
+            lateral_root_mask=root_parts["lateral_root_mask_u8"],
+            root_skeleton_mask=root_parts["skeleton_mask_u8"],
+        )
+        plant_results.append(plant_result)
+        plant_rows.append(plant_traits)
+        leaf_rows.extend(plant_leaf_rows)
+        tray_analyzer._draw_seedling_overlay(
+            overlay_bgr,
+            plant_result,
+            color=tray_analyzer._plant_color_bgr(region_idx, max(1, expected_seedling_count)),
+        )
+
+    plant_summary_df = pd.DataFrame(plant_rows)
+    leaf_detail_df = pd.DataFrame(leaf_rows)
+    counts_columns = ["Plant", "Position", "Estimated Leaves", "Total Root Length (cm)"]
+    counts_df = plant_summary_df[[column for column in counts_columns if column in plant_summary_df.columns]].copy()
+    segmentation_parts = ["Seedling HSV/LAB shoot mask"]
+    if model_crop_count > 0:
+        segmentation_parts.append(f"ONNX root U-Net ({model_crop_count}/{max(1, len(regions))} crops)")
+    if heuristic_fallback_count > 0:
+        segmentation_parts.append(f"heuristic root fallback ({heuristic_fallback_count})")
+
+    return tray_analyzer.TrayAnalysisResult(
+        image_shape=tuple(int(value) for value in image_rgb.shape[:2]),
+        overlay_rgb=cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB),
+        analysis_kind=ANALYSIS_KIND_SEEDLINGS,
+        counts_df=counts_df,
+        plant_summary_df=plant_summary_df,
+        leaf_detail_df=leaf_detail_df,
+        tray_bbox=(0, 0, image_w, image_h),
+        tray_profile_key=SEEDLINGS_PROFILE_KEY,
+        tray_profile_name="Seedling flat view",
+        grid_rows=1,
+        grid_cols=max(1, expected_seedling_count),
+        container_source="Linked seedling flat view",
+        circle_center_x_shift_ratio=0.0,
+        circle_center_y_shift_ratio=0.0,
+        circle_radius_scale=1.0,
+        tray_long_side_px=0.0,
+        tray_long_side_cm=0.0,
+        pixels_per_cm=pixels_per_cm,
+        pixels_per_cm_override=pixels_per_cm_override,
+        mm_per_pixel=mm_per_pixel,
+        scale_source=scale_source,
+        plant_results=plant_results,
+        segmentation_source=" + ".join(segmentation_parts),
+    )
+
+
 def _build_linked_seedling_batch_payload(
     top_items: list[dict[str, Any]],
     side_items: list[dict[str, Any]],
@@ -1508,12 +1864,11 @@ def _build_linked_seedling_batch_payload(
                 pixels_per_cm_override=side_pixels_per_cm_override,
                 initial_center_ratios=tuple(float(value) for value in top_result["center_ratios"]),
             )
-            flat_result = _analyze_upload(
+            flat_result = _analyze_linked_seedling_flat_view(
                 _get_item_bytes(flat_item),
-                SEEDLINGS_PROFILE_KEY,
-                DEFAULT_TRAY_LONG_SIDE_CM,
-                _coerce_optional_pixels_per_cm(flat_pixels_per_cm_override),
-                container_mode=FULL_IMAGE_CONTAINER_MODE,
+                expected_seedling_count=expected_seedling_count,
+                pixels_per_cm_override=_coerce_optional_pixels_per_cm(flat_pixels_per_cm_override),
+                initial_center_ratios=tuple(float(value) for value in top_result["center_ratios"]),
             )
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
