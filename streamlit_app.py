@@ -11,6 +11,7 @@ from typing import Any
 import cv2
 import numpy as np
 import pandas as pd
+import altair as alt
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
 try:
@@ -22,6 +23,8 @@ try:
     from . import tray_analyzer
 except ImportError:  # pragma: no cover - direct script execution fallback
     import tray_analyzer
+
+alt.data_transformers.disable_max_rows()
 
 tray_analyzer.MAX_PLANT_ANALYSIS_DIM = max(int(getattr(tray_analyzer, "MAX_PLANT_ANALYSIS_DIM", 0) or 0), 4000)
 analyze_tray_image = tray_analyzer.analyze_tray_image
@@ -1330,6 +1333,278 @@ def _attach_leaf_tracks(leaf_detail_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.
         kind="stable",
     )
     return tracked_df, leaf_tracks_df
+
+
+def _resolve_timeseries_axis(df: pd.DataFrame) -> tuple[str | None, str | None, list[str]]:
+    if df.empty:
+        return None, None, []
+    if "Timepoint Value" in df.columns and df["Timepoint Value"].notna().sum() >= 2:
+        tooltip_columns = ["Timepoint Label"] if "Timepoint Label" in df.columns else []
+        return "Timepoint Value", "Timepoint", tooltip_columns
+    if "Frame Index" in df.columns and df["Frame Index"].notna().sum() >= 2:
+        tooltip_columns = ["Timepoint Label"] if "Timepoint Label" in df.columns else []
+        return "Frame Index", "Frame", tooltip_columns
+    return None, None, []
+
+
+def _timeseries_metric_columns(df: pd.DataFrame) -> list[str]:
+    if df.empty:
+        return []
+
+    excluded_exact = {
+        "Frame Index",
+        "Timepoint Value",
+        "Grid Row",
+        "Grid Column",
+        "Grid Rows",
+        "Grid Columns",
+        "Site Index",
+        "Leaf ID",
+        "Leaf Track ID",
+        "Circle X Shift (%)",
+        "Circle Y Shift (%)",
+        "Circle Size (%)",
+        "Circle Center X Shift (%)",
+        "Circle Center Y Shift (%)",
+        "Circle Radius Scale (%)",
+        "Tray Long Side (px)",
+        "Tray Long Side (cm)",
+        "Pixels Per Cm",
+        "Pixels Per Cm Override",
+        "Mm Per Pixel",
+        "Track Matched From Previous",
+        "Track Match Distance (px)",
+        "Track Area Ratio",
+    }
+    metric_columns: list[str] = []
+    for column in df.columns:
+        if column in excluded_exact:
+            continue
+        series = df[column]
+        if pd.api.types.is_bool_dtype(series):
+            continue
+        if pd.api.types.is_numeric_dtype(series) and series.notna().any():
+            metric_columns.append(column)
+    return metric_columns
+
+
+def _line_chart(
+    data: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    y_title: str,
+    x_title: str,
+    tooltip_columns: list[str],
+    color_col: str | None = None,
+) -> alt.Chart:
+    tooltip = [alt.Tooltip(f"{x_col}:Q", title=x_title)]
+    for column in tooltip_columns:
+        if column in data.columns:
+            tooltip.append(alt.Tooltip(f"{column}:N", title=column))
+    tooltip.append(alt.Tooltip(f"{y_col}:Q", title=y_title))
+    if color_col is not None and color_col in data.columns:
+        tooltip.append(alt.Tooltip(f"{color_col}:N", title=color_col))
+
+    chart = alt.Chart(data).mark_line(point=True).encode(
+        x=alt.X(f"{x_col}:Q", title=x_title),
+        y=alt.Y(f"{y_col}:Q", title=y_title),
+        tooltip=tooltip,
+    )
+    if color_col is not None and color_col in data.columns:
+        chart = chart.encode(color=alt.Color(f"{color_col}:N", title=color_col))
+    return chart.properties(height=360)
+
+
+def _render_timeseries_growth_section(
+    image_summary_df: pd.DataFrame,
+    plant_summary_df: pd.DataFrame,
+    leaf_tracks_df: pd.DataFrame,
+) -> None:
+    x_col, x_title, tooltip_columns = _resolve_timeseries_axis(image_summary_df)
+    if x_col is None:
+        st.info("Time series plots need at least two ordered frames.")
+        return
+
+    st.subheader("Growth Over Time")
+    st.caption("Choose any measured numeric trait and explore its development over time at batch, plant, or tracked-leaf level.")
+
+    tab_labels = ["Batch totals", "Per-plant traits"]
+    if not leaf_tracks_df.empty:
+        tab_labels.append("Leaf-track traits")
+    tabs = st.tabs(tab_labels)
+
+    with tabs[0]:
+        batch_metric_options = _timeseries_metric_columns(image_summary_df)
+        default_batch_metrics = [
+            column
+            for column in ("Estimated Leaves", "Total Canopy Area (cm^2)", "Plants With Canopy", "Total Root Length (cm)")
+            if column in batch_metric_options
+        ][:3]
+        selected_batch_metrics = st.multiselect(
+            "Batch metrics",
+            options=batch_metric_options,
+            default=default_batch_metrics or batch_metric_options[: min(3, len(batch_metric_options))],
+            key="timeseries_batch_metric_selection",
+        )
+        if selected_batch_metrics:
+            plot_df = image_summary_df[[x_col, *tooltip_columns, *selected_batch_metrics]].melt(
+                id_vars=[x_col, *tooltip_columns],
+                value_vars=selected_batch_metrics,
+                var_name="Metric",
+                value_name="Value",
+            ).dropna(subset=["Value"])
+            if not plot_df.empty:
+                chart = alt.Chart(plot_df).mark_line(point=True).encode(
+                    x=alt.X(f"{x_col}:Q", title=x_title),
+                    y=alt.Y("Value:Q", title="Metric value"),
+                    color=alt.Color("Metric:N", title="Metric"),
+                    tooltip=[
+                        alt.Tooltip(f"{x_col}:Q", title=x_title),
+                        *(alt.Tooltip(f"{column}:N", title=column) for column in tooltip_columns if column in plot_df.columns),
+                        alt.Tooltip("Metric:N", title="Metric"),
+                        alt.Tooltip("Value:Q", title="Value"),
+                    ],
+                ).properties(height=360)
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.info("The selected batch metrics do not have enough values to plot.")
+        else:
+            st.info("Select one or more batch metrics to plot.")
+
+    with tabs[1]:
+        plant_metric_options = _timeseries_metric_columns(plant_summary_df)
+        if not plant_metric_options:
+            st.info("No plant-level numeric traits are available for plotting.")
+        else:
+            control_cols = st.columns([0.34, 0.26, 0.4])
+            plant_metric = control_cols[0].selectbox(
+                "Plant trait",
+                options=plant_metric_options,
+                index=plant_metric_options.index("Canopy Area (cm^2)") if "Canopy Area (cm^2)" in plant_metric_options else 0,
+                key="timeseries_plant_metric",
+            )
+            aggregate_mode = control_cols[1].selectbox(
+                "Aggregate",
+                options=["Mean", "Median", "Sum", "Max", "Min"],
+                index=0,
+                key="timeseries_plant_aggregate",
+            )
+            group_column_options = [column for column in ("Position", "Plant") if column in plant_summary_df.columns]
+            group_column = control_cols[2].selectbox(
+                "Individual series label",
+                options=group_column_options,
+                index=0,
+                key="timeseries_plant_group_column",
+            )
+
+            aggregate_df = (
+                plant_summary_df.groupby([x_col, *tooltip_columns], dropna=False)[plant_metric]
+                .agg(aggregate_mode.lower())
+                .reset_index(name="Value")
+                .dropna(subset=["Value"])
+            )
+            if not aggregate_df.empty:
+                st.caption(f"{aggregate_mode} of `{plant_metric}` across all plants")
+                st.altair_chart(
+                    _line_chart(
+                        aggregate_df,
+                        x_col=x_col,
+                        y_col="Value",
+                        y_title=f"{aggregate_mode} {plant_metric}",
+                        x_title=x_title,
+                        tooltip_columns=tooltip_columns,
+                    ),
+                    use_container_width=True,
+                )
+
+            entity_values = sorted(
+                (str(value) for value in plant_summary_df[group_column].dropna().unique()),
+                key=_natural_sort_key,
+            )
+            default_entities = entity_values[: min(12, len(entity_values))]
+            selected_entities = st.multiselect(
+                f"Plot individual {group_column.lower()} series",
+                options=entity_values,
+                default=default_entities,
+                key="timeseries_plant_entities",
+                help="Choose the plants or positions you want to compare over time.",
+            )
+            if selected_entities:
+                individual_df = plant_summary_df[
+                    plant_summary_df[group_column].astype(str).isin(selected_entities)
+                ].copy()
+                individual_df[group_column] = individual_df[group_column].astype(str)
+                individual_df = individual_df.dropna(subset=[plant_metric])
+                if not individual_df.empty:
+                    st.altair_chart(
+                        _line_chart(
+                            individual_df,
+                            x_col=x_col,
+                            y_col=plant_metric,
+                            y_title=plant_metric,
+                            x_title=x_title,
+                            tooltip_columns=tooltip_columns,
+                            color_col=group_column,
+                        ),
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("The selected plants do not have values for that trait.")
+            else:
+                st.info("Select one or more plants or positions to compare their trajectories.")
+
+    if not leaf_tracks_df.empty:
+        with tabs[2]:
+            leaf_metric_options = _timeseries_metric_columns(leaf_tracks_df)
+            if not leaf_metric_options:
+                st.info("No tracked leaf-level numeric traits are available for plotting.")
+            else:
+                leaf_metric = st.selectbox(
+                    "Leaf-track trait",
+                    options=leaf_metric_options,
+                    index=leaf_metric_options.index("Area (cm^2)") if "Area (cm^2)" in leaf_metric_options else 0,
+                    key="timeseries_leaf_metric",
+                )
+                plant_filter_options = ["All plants"] + sorted(
+                    (str(value) for value in leaf_tracks_df["Plant"].dropna().unique()),
+                    key=_natural_sort_key,
+                )
+                selected_plant_filter = st.selectbox(
+                    "Plant filter",
+                    options=plant_filter_options,
+                    index=0,
+                    key="timeseries_leaf_plant_filter",
+                )
+                filtered_tracks_df = leaf_tracks_df.copy()
+                if selected_plant_filter != "All plants":
+                    filtered_tracks_df = filtered_tracks_df[filtered_tracks_df["Plant"].astype(str) == selected_plant_filter]
+                filtered_tracks_df["Leaf Track"] = filtered_tracks_df["Leaf Track ID"].astype(str).map(lambda value: f"Track {value}")
+                track_values = sorted(filtered_tracks_df["Leaf Track"].dropna().unique(), key=_natural_sort_key)
+                selected_tracks = st.multiselect(
+                    "Leaf tracks",
+                    options=track_values,
+                    default=track_values[: min(10, len(track_values))],
+                    key="timeseries_leaf_tracks",
+                )
+                if selected_tracks:
+                    plotted_tracks_df = filtered_tracks_df[filtered_tracks_df["Leaf Track"].isin(selected_tracks)].dropna(subset=[leaf_metric])
+                    if not plotted_tracks_df.empty:
+                        st.altair_chart(
+                            _line_chart(
+                                plotted_tracks_df,
+                                x_col=x_col,
+                                y_col=leaf_metric,
+                                y_title=leaf_metric,
+                                x_title=x_title,
+                                tooltip_columns=["Plant", *tooltip_columns] if "Plant" in plotted_tracks_df.columns else tooltip_columns,
+                                color_col="Leaf Track",
+                            ),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.info("The selected leaf tracks do not have values for that trait.")
+                else:
+                    st.info("Select one or more tracked leaves to compare their trajectories.")
 
 
 def _collect_uploaded_items(
@@ -3239,6 +3514,13 @@ def main() -> None:
 
     st.subheader("Batch Image Summary")
     st.dataframe(image_summary_df, hide_index=True, use_container_width=True)
+
+    if dataset_mode == DATASET_MODE_TIMESERIES:
+        _render_timeseries_growth_section(
+            image_summary_df=image_summary_df,
+            plant_summary_df=plant_summary_df,
+            leaf_tracks_df=leaf_tracks_df,
+        )
 
     record_labels = [_record_label(record) for record in batch_payload["records"]]
     selected_name = st.selectbox(
