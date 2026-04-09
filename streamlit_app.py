@@ -32,6 +32,7 @@ CONTAINER_MODE_LABELS = {key: label for key, label in CONTAINER_MODE_OPTIONS}
 DEFAULT_TRAY_PROFILE_KEY = getattr(tray_analyzer, "AUTO_TRAY_PROFILE_KEY", TRAY_PROFILE_OPTIONS[0][0])
 CUSTOM_TRAY_PROFILE_KEY = getattr(tray_analyzer, "CUSTOM_TRAY_PROFILE_KEY", "custom")
 SEEDLINGS_PROFILE_KEY = getattr(tray_analyzer, "SEEDLINGS_PROFILE_KEY", "seedlings")
+LETTUCE_2X2_PROFILE_KEY = getattr(tray_analyzer, "LETTUCE_2X2_PROFILE_KEY", "lettuce_2x2")
 DEFAULT_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_AUTO", "auto")
 DEFAULT_TRAY_LONG_SIDE_CM = float(getattr(tray_analyzer, "TRAY_LONG_SIDE_CM", 33.0))
 ANALYSIS_KIND_SEEDLINGS = getattr(tray_analyzer, "ANALYSIS_KIND_SEEDLINGS", "seedlings")
@@ -2833,6 +2834,10 @@ def main() -> None:
     )
     if tray_profile_key == DEFAULT_TRAY_PROFILE_KEY:
         st.caption("Auto layout chooses between a 4-plant 2x2 tray and a 20-plant 4x5 Arabidopsis tray from the canopy pattern.")
+    if tray_profile_key == LETTUCE_2X2_PROFILE_KEY:
+        st.caption(
+            "Lettuce mode uses the 2x2 tray layout with the purple-friendly foliage segmentation path and slightly looser site padding for larger rosettes."
+        )
     if tray_profile_key == SEEDLINGS_PROFILE_KEY:
         st.caption(
             "Seedlings mode separates green shoots from roots and reports primary-root and lateral-root traits per seedling. "

@@ -23,6 +23,7 @@ BASE_PLANT_COLORS_BGR = [
 
 AUTO_TRAY_PROFILE_KEY = "auto"
 GRID_2X2_PROFILE_KEY = "grid_2x2"
+LETTUCE_2X2_PROFILE_KEY = "lettuce_2x2"
 GRID_4X5_PROFILE_KEY = "grid_4x5"
 CUSTOM_TRAY_PROFILE_KEY = "custom"
 SEEDLINGS_PROFILE_KEY = "seedlings"
@@ -55,6 +56,16 @@ TRAY_PROFILES: dict[str, TrayProfile] = {
         name="Potato / Soybean (2x2)",
         rows=2,
         cols=2,
+    ),
+    LETTUCE_2X2_PROFILE_KEY: TrayProfile(
+        key=LETTUCE_2X2_PROFILE_KEY,
+        name="Lettuce (2x2)",
+        rows=2,
+        cols=2,
+        outer_pad_ratio_x=0.045,
+        outer_pad_ratio_y=0.045,
+        site_pad_ratio_x=0.035,
+        site_pad_ratio_y=0.035,
     ),
     GRID_4X5_PROFILE_KEY: TrayProfile(
         key=GRID_4X5_PROFILE_KEY,
@@ -130,6 +141,7 @@ def get_tray_profile_options() -> list[tuple[str, str]]:
     return [
         (AUTO_TRAY_PROFILE_KEY, "Auto (2x2 or 4x5)"),
         (GRID_2X2_PROFILE_KEY, TRAY_PROFILES[GRID_2X2_PROFILE_KEY].name),
+        (LETTUCE_2X2_PROFILE_KEY, TRAY_PROFILES[LETTUCE_2X2_PROFILE_KEY].name),
         (GRID_4X5_PROFILE_KEY, TRAY_PROFILES[GRID_4X5_PROFILE_KEY].name),
         (SEEDLINGS_PROFILE_KEY, "Seedlings (roots + shoots)"),
         (CUSTOM_TRAY_PROFILE_KEY, "Universal / Custom Grid"),
