@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,9 @@ FLAT_ROOT_ONNX_MODEL_PATH = APP_ROOT / "models" / "root_unet_ecotron.onnx"
 FLAT_ROOT_ONNX_MASK_THRESHOLD = 0.2
 FLAT_ROOT_ONNX_MIN_PIXELS = 180
 FLAT_ROOT_ONNX_SHOOT_BUFFER_PX = 13
+LEAF_TRACK_MAX_DISTANCE_PX = 180.0
+LEAF_TRACK_MAX_DISTANCE_MULTIPLIER = 2.6
+LEAF_TRACK_AREA_LOG_WEIGHT = 0.28
 
 
 def _open_rgb_image(image_bytes: bytes) -> Image.Image:
@@ -789,6 +793,7 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
         zf.writestr("image_summary.csv", _csv_bytes(batch_payload["image_summary_df"]))
         zf.writestr("plant_summary.csv", _csv_bytes(batch_payload["plant_summary_df"]))
         zf.writestr("leaf_details.csv", _csv_bytes(batch_payload["leaf_detail_df"]))
+        zf.writestr("leaf_tracks.csv", _csv_bytes(batch_payload["leaf_tracks_df"]))
 
         for record in batch_payload["records"]:
             item = record["item"]
@@ -1002,12 +1007,57 @@ def _build_batch_payload(
     plant_summary_df = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
     leaf_detail_df = pd.concat(leaf_frames, ignore_index=True) if leaf_frames else pd.DataFrame()
     skipped_df = pd.DataFrame(skipped_items)
+    frame_metadata_df = _build_frame_metadata_df(records)
+    if not frame_metadata_df.empty:
+        image_summary_df = image_summary_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
+        if not plant_summary_df.empty:
+            plant_summary_df = plant_summary_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
+        if not leaf_detail_df.empty:
+            leaf_detail_df = leaf_detail_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
+    leaf_detail_df, leaf_tracks_df = _attach_leaf_tracks(leaf_detail_df)
+    image_summary_df = _with_leading_columns(
+        image_summary_df,
+        ["Image", "Source Path", "Frame Index", "Timepoint Label", "Timepoint Value"],
+    )
+    plant_summary_df = _with_leading_columns(
+        plant_summary_df,
+        ["Image", "Source Path", "Frame Index", "Timepoint Label", "Timepoint Value", "Plant", "Position"],
+    )
+    leaf_detail_df = _with_leading_columns(
+        leaf_detail_df,
+        [
+            "Image",
+            "Source Path",
+            "Frame Index",
+            "Timepoint Label",
+            "Timepoint Value",
+            "Plant",
+            "Position",
+            "Leaf Track ID",
+            "Leaf ID",
+        ],
+    )
+    leaf_tracks_df = _with_leading_columns(
+        leaf_tracks_df,
+        [
+            "Image",
+            "Source Path",
+            "Frame Index",
+            "Timepoint Label",
+            "Timepoint Value",
+            "Plant",
+            "Position",
+            "Leaf Track ID",
+            "Leaf ID",
+        ],
+    )
 
     return {
         "records": records,
         "image_summary_df": image_summary_df,
         "plant_summary_df": plant_summary_df,
         "leaf_detail_df": leaf_detail_df,
+        "leaf_tracks_df": leaf_tracks_df,
         "skipped_df": skipped_df,
     }
 
@@ -1015,7 +1065,7 @@ def _build_batch_payload(
 def _results_zip_signature(batch_payload: dict[str, Any], results_bundle_name: str) -> str:
     digest = hashlib.sha1()
     digest.update(results_bundle_name.encode("utf-8"))
-    for key in ("image_summary_df", "plant_summary_df", "leaf_detail_df", "skipped_df"):
+    for key in ("image_summary_df", "plant_summary_df", "leaf_detail_df", "leaf_tracks_df", "skipped_df"):
         csv_bytes = _csv_bytes(batch_payload[key]) if key in batch_payload and isinstance(batch_payload[key], pd.DataFrame) else b""
         digest.update(key.encode("utf-8"))
         digest.update(csv_bytes)
@@ -1037,10 +1087,12 @@ def _write_batch_outputs(output_dir_str: str, batch_payload: dict[str, Any]) -> 
         output_dir / "image_summary.csv",
         output_dir / "plant_summary.csv",
         output_dir / "leaf_details.csv",
+        output_dir / "leaf_tracks.csv",
     ]
     batch_payload["image_summary_df"].to_csv(written_paths[0], index=False)
     batch_payload["plant_summary_df"].to_csv(written_paths[1], index=False)
     batch_payload["leaf_detail_df"].to_csv(written_paths[2], index=False)
+    batch_payload["leaf_tracks_df"].to_csv(written_paths[3], index=False)
 
     for record in batch_payload["records"]:
         overlay_path = overlays_dir / f"{record['export_stem']}_overlay.png"
@@ -1048,6 +1100,224 @@ def _write_batch_outputs(output_dir_str: str, batch_payload: dict[str, Any]) -> 
         written_paths.append(overlay_path)
 
     return written_paths
+
+
+def _with_leading_columns(df: pd.DataFrame, leading_columns: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    ordered = [column for column in leading_columns if column in df.columns]
+    trailing = [column for column in df.columns if column not in ordered]
+    return df[ordered + trailing]
+
+
+def _natural_sort_key(value: str) -> tuple[tuple[int, Any], ...]:
+    parts = re.split(r"(\d+)", str(value).lower())
+    key_parts: list[tuple[int, Any]] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key_parts.append((0, int(part)))
+        else:
+            key_parts.append((1, part))
+    return tuple(key_parts)
+
+
+def _extract_timepoint_metadata(value: str) -> tuple[str | None, float | None]:
+    stem = Path(str(value).split("::")[-1]).stem.lower()
+    for pattern in (
+        r"(round)[_-]?(\d+)",
+        r"(day)[_-]?(\d+)",
+        r"(timepoint|tp)[_-]?(\d+)",
+        r"(frame)[_-]?(\d+)",
+        r"(week)[_-]?(\d+)",
+    ):
+        match = re.search(pattern, stem)
+        if match:
+            prefix = match.group(1)
+            number = float(match.group(2))
+            return f"{prefix}{int(number)}", number
+    return None, None
+
+
+def _build_frame_metadata_df(records: list[dict[str, Any]]) -> pd.DataFrame:
+    frame_rows: list[dict[str, Any]] = []
+    for upload_index, record in enumerate(records):
+        source_path = str(record.get("source_path", "") or "")
+        image_name = str(record.get("name", "") or "")
+        timepoint_label, timepoint_value = _extract_timepoint_metadata(source_path or image_name)
+        sort_reference = source_path or image_name
+        sort_key: tuple[Any, ...]
+        if timepoint_value is not None:
+            sort_key = (0, float(timepoint_value), _natural_sort_key(sort_reference), upload_index)
+        else:
+            sort_key = (1, _natural_sort_key(sort_reference), upload_index)
+        frame_rows.append(
+            {
+                "Image": image_name,
+                "Source Path": source_path,
+                "Timepoint Label": timepoint_label,
+                "Timepoint Value": timepoint_value,
+                "_sort_key": sort_key,
+            }
+        )
+
+    if not frame_rows:
+        return pd.DataFrame(columns=["Image", "Source Path", "Frame Index", "Timepoint Label", "Timepoint Value"])
+
+    frame_rows.sort(key=lambda row: row["_sort_key"])
+    for frame_index, row in enumerate(frame_rows, start=1):
+        row["Frame Index"] = int(frame_index)
+        if not row["Timepoint Label"]:
+            row["Timepoint Label"] = f"Frame {frame_index}"
+        row.pop("_sort_key", None)
+    return pd.DataFrame(frame_rows)
+
+
+def _safe_numeric(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _leaf_observation_from_row(row: pd.Series) -> dict[str, Any] | None:
+    centroid_x = _safe_numeric(row.get("Centroid X"))
+    centroid_y = _safe_numeric(row.get("Centroid Y"))
+    area_px = _safe_numeric(row.get("Area (px)"))
+    bbox_width = _safe_numeric(row.get("BBox Width (px)"))
+    bbox_height = _safe_numeric(row.get("BBox Height (px)"))
+    if centroid_x is None or centroid_y is None or area_px is None:
+        return None
+    span = max(float(bbox_width or 0.0), float(bbox_height or 0.0), 24.0)
+    return {
+        "row_index": int(row.name),
+        "centroid_x": float(centroid_x),
+        "centroid_y": float(centroid_y),
+        "area_px": max(float(area_px), 1.0),
+        "span_px": float(span),
+    }
+
+
+def _leaf_match_candidates(previous_obs: list[dict[str, Any]], current_obs: list[dict[str, Any]]) -> list[tuple[float, float, float, int, int]]:
+    candidates: list[tuple[float, float, float, int, int]] = []
+    for prev_idx, prev in enumerate(previous_obs):
+        for curr_idx, curr in enumerate(current_obs):
+            dist_px = float(np.hypot(curr["centroid_x"] - prev["centroid_x"], curr["centroid_y"] - prev["centroid_y"]))
+            max_dist_px = max(
+                LEAF_TRACK_MAX_DISTANCE_PX,
+                LEAF_TRACK_MAX_DISTANCE_MULTIPLIER * max(prev["span_px"], curr["span_px"]),
+            )
+            if dist_px > max_dist_px:
+                continue
+            area_ratio = max(prev["area_px"], curr["area_px"]) / max(1.0, min(prev["area_px"], curr["area_px"]))
+            score = (dist_px / max_dist_px) + (LEAF_TRACK_AREA_LOG_WEIGHT * abs(np.log(area_ratio)))
+            candidates.append((score, dist_px, area_ratio, prev_idx, curr_idx))
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    return candidates
+
+
+def _attach_leaf_tracks(leaf_detail_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if leaf_detail_df.empty or "Frame Index" not in leaf_detail_df.columns:
+        return leaf_detail_df, pd.DataFrame()
+    if int(leaf_detail_df["Frame Index"].nunique(dropna=True)) < 2:
+        return leaf_detail_df, pd.DataFrame()
+
+    tracked_df = leaf_detail_df.copy()
+    tracked_df["Leaf Track ID"] = pd.Series([pd.NA] * len(tracked_df), dtype="Int64")
+    tracked_df["Track Matched From Previous"] = False
+    tracked_df["Track Match Distance (px)"] = np.nan
+    tracked_df["Track Area Ratio"] = np.nan
+
+    next_track_id = 1
+    group_columns = [column for column in ("Plant", "Position", "Grid Row", "Grid Column") if column in tracked_df.columns]
+    if not group_columns:
+        group_columns = ["Plant"] if "Plant" in tracked_df.columns else []
+    if not group_columns:
+        return tracked_df, pd.DataFrame()
+
+    for _, group in tracked_df.groupby(group_columns, sort=False):
+        group_sorted = group.sort_values(["Frame Index", "Leaf ID", "Centroid X", "Centroid Y"], kind="stable")
+        previous_obs: list[dict[str, Any]] = []
+        for _, frame_group in group_sorted.groupby("Frame Index", sort=True):
+            current_obs = []
+            for _, row in frame_group.iterrows():
+                obs = _leaf_observation_from_row(row)
+                if obs is not None:
+                    current_obs.append(obs)
+
+            if not current_obs:
+                previous_obs = []
+                continue
+
+            if not previous_obs:
+                for obs in current_obs:
+                    tracked_df.at[obs["row_index"], "Leaf Track ID"] = int(next_track_id)
+                    obs["track_id"] = int(next_track_id)
+                    next_track_id += 1
+                previous_obs = current_obs
+                continue
+
+            matched_prev: set[int] = set()
+            matched_curr: set[int] = set()
+            for _, dist_px, area_ratio, prev_idx, curr_idx in _leaf_match_candidates(previous_obs, current_obs):
+                if prev_idx in matched_prev or curr_idx in matched_curr:
+                    continue
+                track_id = int(previous_obs[prev_idx]["track_id"])
+                current_obs[curr_idx]["track_id"] = track_id
+                tracked_df.at[current_obs[curr_idx]["row_index"], "Leaf Track ID"] = track_id
+                tracked_df.at[current_obs[curr_idx]["row_index"], "Track Matched From Previous"] = True
+                tracked_df.at[current_obs[curr_idx]["row_index"], "Track Match Distance (px)"] = round(float(dist_px), 3)
+                tracked_df.at[current_obs[curr_idx]["row_index"], "Track Area Ratio"] = round(float(area_ratio), 4)
+                matched_prev.add(prev_idx)
+                matched_curr.add(curr_idx)
+
+            for curr_idx, obs in enumerate(current_obs):
+                if curr_idx in matched_curr:
+                    continue
+                tracked_df.at[obs["row_index"], "Leaf Track ID"] = int(next_track_id)
+                obs["track_id"] = int(next_track_id)
+                next_track_id += 1
+
+            previous_obs = current_obs
+
+    tracked_df["Leaf Track ID"] = tracked_df["Leaf Track ID"].astype("Int64")
+    if tracked_df["Leaf Track ID"].isna().all():
+        return tracked_df, pd.DataFrame()
+
+    track_columns = [
+        column
+        for column in (
+            "Image",
+            "Source Path",
+            "Frame Index",
+            "Timepoint Label",
+            "Timepoint Value",
+            "Plant",
+            "Position",
+            "Grid Row",
+            "Grid Column",
+            "Leaf ID",
+            "Leaf Track ID",
+            "Track Matched From Previous",
+            "Track Match Distance (px)",
+            "Track Area Ratio",
+            "Area (px)",
+            "Area (cm^2)",
+            "Centroid X",
+            "Centroid Y",
+            "Orientation (deg)",
+        )
+        if column in tracked_df.columns
+    ]
+    leaf_tracks_df = tracked_df[track_columns].copy().sort_values(
+        ["Leaf Track ID", "Frame Index", "Plant", "Leaf ID"],
+        kind="stable",
+    )
+    return tracked_df, leaf_tracks_df
 
 
 def _collect_uploaded_items(
@@ -2833,6 +3103,7 @@ def main() -> None:
     image_summary_df = batch_payload["image_summary_df"]
     plant_summary_df = batch_payload["plant_summary_df"]
     leaf_detail_df = batch_payload["leaf_detail_df"]
+    leaf_tracks_df = batch_payload["leaf_tracks_df"]
     skipped_df = batch_payload["skipped_df"]
 
     if not skipped_df.empty:
@@ -2845,22 +3116,26 @@ def main() -> None:
         return
 
     has_root_summary = "Total Root Length (cm)" in image_summary_df.columns
-    summary_columns = st.columns(4 if has_root_summary else 3)
-    summary_col_1, summary_col_2, summary_col_3 = summary_columns[:3]
-    with summary_col_1:
-        st.metric("Images", int(len(batch_payload["records"])))
-    with summary_col_2:
-        st.metric("Total estimated leaves", int(image_summary_df["Estimated Leaves"].sum()))
-    with summary_col_3:
-        st.metric("Total canopy area (cm^2)", round(float(image_summary_df["Total Canopy Area (cm^2)"].sum()), 2))
+    has_leaf_tracking = not leaf_tracks_df.empty
+    summary_metrics = [
+        ("Images", int(len(batch_payload["records"]))),
+        ("Total estimated leaves", int(image_summary_df["Estimated Leaves"].sum())),
+        ("Total canopy area (cm^2)", round(float(image_summary_df["Total Canopy Area (cm^2)"].sum()), 2)),
+    ]
     if has_root_summary:
-        with summary_columns[3]:
-            st.metric("Total root length (cm)", round(float(image_summary_df["Total Root Length (cm)"].fillna(0).sum()), 2))
-    with summary_col_1:
+        summary_metrics.append(("Total root length (cm)", round(float(image_summary_df["Total Root Length (cm)"].fillna(0).sum()), 2)))
+    if has_leaf_tracking:
+        summary_metrics.append(("Tracked leaf paths", int(leaf_tracks_df["Leaf Track ID"].nunique())))
+    summary_columns = st.columns(len(summary_metrics))
+    for column, (label, value) in zip(summary_columns, summary_metrics):
+        with column:
+            st.metric(label, value)
+    with summary_columns[0]:
         if zip_archive_count > 0:
             st.caption(f"Zip inputs: {zip_archive_count}")
 
-    batch_export_col_1, batch_export_col_2, batch_export_col_3, batch_export_col_4 = st.columns(4)
+    batch_export_columns = st.columns(5 if has_leaf_tracking else 4)
+    batch_export_col_1, batch_export_col_2, batch_export_col_3 = batch_export_columns[:3]
     with batch_export_col_1:
         st.download_button(
             "Download Image Summary CSV",
@@ -2885,7 +3160,19 @@ def main() -> None:
             mime="text/csv",
             use_container_width=True,
         )
-    with batch_export_col_4:
+    if has_leaf_tracking:
+        with batch_export_columns[3]:
+            st.download_button(
+                "Download Leaf Tracks CSV",
+                data=_csv_bytes(leaf_tracks_df),
+                file_name="leaf_tracks.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        zip_export_column = batch_export_columns[4]
+    else:
+        zip_export_column = batch_export_columns[3]
+    with zip_export_column:
         prepared_results_zip_bytes = st.session_state.get("prepared_results_zip_bytes")
         if prepared_results_zip_bytes is None:
             if st.button("Prepare Full Results ZIP", use_container_width=True):
@@ -2924,7 +3211,11 @@ def main() -> None:
     with st.expander("Batch Per-Leaf Table", expanded=False):
         st.dataframe(leaf_detail_df, hide_index=True, use_container_width=True, height=420)
 
-    st.caption("Upload mode supports single images, large batches of images, and zip archives directly in the browser.")
+    if has_leaf_tracking:
+        with st.expander("Batch Leaf Tracking Table", expanded=False):
+            st.dataframe(leaf_tracks_df, hide_index=True, use_container_width=True, height=420)
+
+    st.caption("Upload mode supports single images, large batches of images, zip archives directly in the browser, and leaf tracking across ordered time-series batches.")
     st.markdown("---")
     st.markdown(
         f"<div style='text-align:center; font-size:0.9rem; color:rgba(250,250,250,0.65);'>{FOOTER_TEXT}</div>",

@@ -211,7 +211,11 @@ def analyze_tray_image(
     plant_results: list[PlantLeafResult] = []
     plant_rows: list[dict[str, object]] = []
     leaf_rows: list[dict[str, object]] = []
-    segmentation_source = "PlantCV color threshold" if pcv is not None else "OpenCV HSV/LAB threshold"
+    segmentation_source = (
+        "PlantCV/OpenCV vegetation threshold (green + anthocyanin)"
+        if pcv is not None
+        else "OpenCV vegetation threshold (green + anthocyanin)"
+    )
 
     for idx, (site, owned_mask) in enumerate(zip(plant_sites, ownership_masks)):
         analysis_bbox, owned_mask_u8 = _build_adaptive_crop_from_mask(
@@ -1795,19 +1799,48 @@ def _segment_leaf_mask(crop_bgr: np.ndarray) -> np.ndarray:
     return _segment_with_opencv(crop_bgr)
 
 
-def _segment_with_opencv(crop_bgr: np.ndarray) -> np.ndarray:
-    working_bgr, scale = _downscale_for_analysis(crop_bgr, MAX_PLANT_ANALYSIS_DIM)
-    hsv = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2HSV)
-    lab = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2LAB)
-
+def _green_vegetation_mask(hsv: np.ndarray, lab: np.ndarray) -> np.ndarray:
     hsv_mask = cv2.inRange(
         hsv,
         np.array([30, 35, 20], dtype=np.uint8),
         np.array([95, 255, 255], dtype=np.uint8),
     )
     lab_mask = cv2.inRange(lab[:, :, 1], 0, 124)
-    mask = cv2.bitwise_and(hsv_mask, lab_mask)
+    return cv2.bitwise_and(hsv_mask, lab_mask)
 
+
+def _anthocyanin_vegetation_mask(working_bgr: np.ndarray, hsv: np.ndarray, lab: np.ndarray) -> np.ndarray:
+    bgr_i16 = working_bgr.astype(np.int16)
+    rgb_i16 = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
+    blue = bgr_i16[:, :, 0]
+    green = bgr_i16[:, :, 1]
+    red = bgr_i16[:, :, 2]
+    exg = (2 * rgb_i16[:, :, 1]) - rgb_i16[:, :, 0] - rgb_i16[:, :, 2]
+
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    a_channel = lab[:, :, 1]
+    b_channel = lab[:, :, 2]
+
+    hue_mask = (((hue <= 25) | (hue >= 150)).astype(np.uint8) * 255)
+    sat_mask = ((sat >= 30).astype(np.uint8) * 255)
+    val_mask = ((val >= 20).astype(np.uint8) * 255)
+    a_mask = ((a_channel >= 126).astype(np.uint8) * 255)
+    b_mask = ((b_channel >= 108).astype(np.uint8) * 255)
+    not_blue_mask = (((blue <= green + 15) | (blue <= red + 15)).astype(np.uint8) * 255)
+    vegetation_bias_mask = (((exg >= -22) | ((red - blue) >= -12)).astype(np.uint8) * 255)
+
+    mask = cv2.bitwise_and(hue_mask, sat_mask)
+    mask = cv2.bitwise_and(mask, val_mask)
+    mask = cv2.bitwise_and(mask, a_mask)
+    mask = cv2.bitwise_and(mask, b_mask)
+    mask = cv2.bitwise_and(mask, not_blue_mask)
+    mask = cv2.bitwise_and(mask, vegetation_bias_mask)
+    return mask
+
+
+def _cleanup_vegetation_mask(mask: np.ndarray) -> np.ndarray:
     mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_OPEN,
@@ -1820,6 +1853,17 @@ def _segment_with_opencv(crop_bgr: np.ndarray) -> np.ndarray:
         np.ones((5, 5), dtype=np.uint8),
         iterations=2,
     )
+    return mask
+
+
+def _segment_with_opencv(crop_bgr: np.ndarray) -> np.ndarray:
+    working_bgr, scale = _downscale_for_analysis(crop_bgr, MAX_PLANT_ANALYSIS_DIM)
+    hsv = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2LAB)
+    green_mask = _green_vegetation_mask(hsv, lab)
+    purple_mask = _anthocyanin_vegetation_mask(working_bgr, hsv, lab)
+    mask = cv2.bitwise_or(green_mask, purple_mask)
+    mask = _cleanup_vegetation_mask(mask)
     if scale != 1.0:
         mask = cv2.resize(mask, (crop_bgr.shape[1], crop_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask
@@ -1828,6 +1872,8 @@ def _segment_with_opencv(crop_bgr: np.ndarray) -> np.ndarray:
 def _segment_with_plantcv(crop_bgr: np.ndarray) -> np.ndarray:
     working_bgr, scale = _downscale_for_analysis(crop_bgr, MAX_PLANT_ANALYSIS_DIM)
     crop_rgb = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2RGB)
+    hsv = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2LAB)
     hsv_mask, _ = _pcv_custom_range(
         crop_rgb,
         lower_thresh=[30, 35, 20],
@@ -1840,7 +1886,9 @@ def _segment_with_plantcv(crop_bgr: np.ndarray) -> np.ndarray:
         upper_thresh=[255, 124, 255],
         channel="LAB",
     )
-    mask = cv2.bitwise_and(hsv_mask, lab_mask)
+    green_mask = cv2.bitwise_and(hsv_mask, lab_mask)
+    purple_mask = _anthocyanin_vegetation_mask(working_bgr, hsv, lab)
+    mask = cv2.bitwise_or(green_mask, purple_mask)
 
     try:
         mask = pcv.fill(bin_img=mask, size=max(64, mask.size // 400))
@@ -1852,18 +1900,7 @@ def _segment_with_plantcv(crop_bgr: np.ndarray) -> np.ndarray:
     except Exception:
         pass
 
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        np.ones((5, 5), dtype=np.uint8),
-        iterations=1,
-    )
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        np.ones((5, 5), dtype=np.uint8),
-        iterations=2,
-    )
+    mask = _cleanup_vegetation_mask(mask)
     if scale != 1.0:
         mask = cv2.resize(mask, (crop_bgr.shape[1], crop_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask

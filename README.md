@@ -13,6 +13,22 @@ Streamlit Community Cloud app for tray, chamber, and seedling phenotyping.
   - side-view shoot height
   - flat roots + shoots
 
+## Tray batch workflow
+
+Standard tray batches now support:
+
+- green and purple / anthocyanin foliage segmentation on the same tray
+- per-image frame ordering with parsed labels such as `round32`, `day5`, or `frame12`
+- batch leaf tracking across ordered uploads for the same tray sequence
+
+Outputs now include:
+
+- `image_summary.csv`
+- `plant_summary.csv`
+- `leaf_details.csv`
+- `leaf_tracks.csv`
+- a full results ZIP with originals, overlays, and masks
+
 ## Linked seedling workflow
 
 In `Tray layout = Seedlings`, switch `Seedling workflow` to:
@@ -58,3 +74,4 @@ python3 -m venv .venv
 - ZIP uploads are supported directly in the browser.
 - Invalid files inside ZIP archives are skipped instead of crashing the batch.
 - Full results ZIPs are prepared on demand to keep memory use lower on Streamlit Community Cloud.
+- Leaf tracking works best when one upload batch represents a single repeated imaging series of the same tray.
