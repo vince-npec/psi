@@ -33,6 +33,7 @@ DEFAULT_TRAY_PROFILE_KEY = getattr(tray_analyzer, "AUTO_TRAY_PROFILE_KEY", TRAY_
 CUSTOM_TRAY_PROFILE_KEY = getattr(tray_analyzer, "CUSTOM_TRAY_PROFILE_KEY", "custom")
 SEEDLINGS_PROFILE_KEY = getattr(tray_analyzer, "SEEDLINGS_PROFILE_KEY", "seedlings")
 LETTUCE_2X2_PROFILE_KEY = getattr(tray_analyzer, "LETTUCE_2X2_PROFILE_KEY", "lettuce_2x2")
+GROWTH_CHAMBER_PROFILE_KEY = getattr(tray_analyzer, "GROWTH_CHAMBER_PROFILE_KEY", "growth_chamber")
 DEFAULT_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_AUTO", "auto")
 DEFAULT_TRAY_LONG_SIDE_CM = float(getattr(tray_analyzer, "TRAY_LONG_SIDE_CM", 33.0))
 ANALYSIS_KIND_SEEDLINGS = getattr(tray_analyzer, "ANALYSIS_KIND_SEEDLINGS", "seedlings")
@@ -2837,6 +2838,11 @@ def main() -> None:
     if tray_profile_key == LETTUCE_2X2_PROFILE_KEY:
         st.caption(
             "Lettuce mode uses the 2x2 tray layout with the purple-friendly foliage segmentation path and slightly looser site padding for larger rosettes."
+        )
+    if tray_profile_key == GROWTH_CHAMBER_PROFILE_KEY:
+        st.caption(
+            "Growth Chamber Level analyzes the full chamber scene, segments many small plant objects globally, and reports per-object plus chamber-level canopy traits. "
+            "Use `Full image` or a manual pixels/cm calibration when there is no tray-scale reference."
         )
     if tray_profile_key == SEEDLINGS_PROFILE_KEY:
         st.caption(

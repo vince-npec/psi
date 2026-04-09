@@ -25,6 +25,7 @@ AUTO_TRAY_PROFILE_KEY = "auto"
 GRID_2X2_PROFILE_KEY = "grid_2x2"
 LETTUCE_2X2_PROFILE_KEY = "lettuce_2x2"
 GRID_4X5_PROFILE_KEY = "grid_4x5"
+GROWTH_CHAMBER_PROFILE_KEY = "growth_chamber"
 CUSTOM_TRAY_PROFILE_KEY = "custom"
 SEEDLINGS_PROFILE_KEY = "seedlings"
 CONTAINER_MODE_AUTO = "auto"
@@ -33,6 +34,7 @@ CONTAINER_MODE_CIRCLE = "circle"
 CONTAINER_MODE_FULL_IMAGE = "full_image"
 ANALYSIS_KIND_FOLIAGE = "foliage"
 ANALYSIS_KIND_SEEDLINGS = "seedlings"
+ANALYSIS_KIND_GROWTH_CHAMBER = "growth_chamber"
 TRAY_LONG_SIDE_CM = 33.0
 MAX_TRAY_ANALYSIS_DIM = 1400
 MAX_PLANT_ANALYSIS_DIM = 3000
@@ -143,6 +145,7 @@ def get_tray_profile_options() -> list[tuple[str, str]]:
         (GRID_2X2_PROFILE_KEY, TRAY_PROFILES[GRID_2X2_PROFILE_KEY].name),
         (LETTUCE_2X2_PROFILE_KEY, TRAY_PROFILES[LETTUCE_2X2_PROFILE_KEY].name),
         (GRID_4X5_PROFILE_KEY, TRAY_PROFILES[GRID_4X5_PROFILE_KEY].name),
+        (GROWTH_CHAMBER_PROFILE_KEY, "Growth Chamber Level"),
         (SEEDLINGS_PROFILE_KEY, "Seedlings (roots + shoots)"),
         (CUSTOM_TRAY_PROFILE_KEY, "Universal / Custom Grid"),
     ]
@@ -178,6 +181,18 @@ def analyze_tray_image(
     circle_center_x_shift_ratio = _clip_ratio(circle_center_x_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_center_y_shift_ratio = _clip_ratio(circle_center_y_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_radius_scale = _clip_ratio(circle_radius_scale, 1.0, minimum=0.2, maximum=3.0)
+    if tray_profile_key == GROWTH_CHAMBER_PROFILE_KEY:
+        return _analyze_growth_chamber_image(
+            image_rgb=image_rgb,
+            image_bgr=image_bgr,
+            tray_long_side_cm=tray_long_side_cm,
+            pixels_per_cm_override=pixels_per_cm_override,
+            container_mode=container_mode,
+            circular_container_inset_ratio=circular_container_inset_ratio,
+            circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+            circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+            circle_radius_scale=circle_radius_scale,
+        )
     if tray_profile_key == SEEDLINGS_PROFILE_KEY:
         return _analyze_seedling_image(
             image_rgb=image_rgb,
@@ -317,6 +332,158 @@ def analyze_tray_image(
         scale_source=scale_source,
         plant_results=plant_results,
         segmentation_source=segmentation_source,
+    )
+
+
+def _analyze_growth_chamber_image(
+    image_rgb: np.ndarray,
+    image_bgr: np.ndarray,
+    tray_long_side_cm: float,
+    pixels_per_cm_override: float | None,
+    container_mode: str,
+    circular_container_inset_ratio: float,
+    circle_center_x_shift_ratio: float,
+    circle_center_y_shift_ratio: float,
+    circle_radius_scale: float,
+) -> TrayAnalysisResult:
+    tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
+        image_bgr,
+        container_mode=container_mode,
+        circular_container_inset_ratio=circular_container_inset_ratio,
+        circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+        circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+        circle_radius_scale=circle_radius_scale,
+    )
+    tray_x0, tray_y0, tray_x1, tray_y1 = tray_bbox
+    chamber_crop_bgr = image_bgr[tray_y0:tray_y1, tray_x0:tray_x1]
+    chamber_mask_u8 = _segment_growth_chamber_canopy_mask(chamber_crop_bgr)
+    chamber_mask_u8 = cv2.bitwise_and(chamber_mask_u8, container_mask_u8[tray_y0:tray_y1, tray_x0:tray_x1])
+    components, component_labels, grid_rows, grid_cols = _extract_growth_chamber_components(chamber_mask_u8)
+
+    pixels_per_cm_override = _normalize_optional_positive_float(pixels_per_cm_override)
+    pixels_per_cm, mm_per_pixel, scale_source = _resolve_scale_calibration(
+        tray_long_side_px=tray_long_side_px,
+        tray_long_side_cm=tray_long_side_cm,
+        pixels_per_cm_override=pixels_per_cm_override,
+    )
+
+    chamber_profile = TrayProfile(
+        key=GROWTH_CHAMBER_PROFILE_KEY,
+        name="Growth Chamber Level",
+        rows=max(1, grid_rows),
+        cols=max(1, grid_cols),
+        outer_pad_ratio_x=0.0,
+        outer_pad_ratio_y=0.0,
+        site_pad_ratio_x=0.0,
+        site_pad_ratio_y=0.0,
+    )
+
+    overlay_bgr = image_bgr.copy()
+    plant_results: list[PlantLeafResult] = []
+    plant_rows: list[dict[str, object]] = []
+    leaf_rows: list[dict[str, object]] = []
+
+    for idx, component in enumerate(components):
+        local_x0, local_y0, local_x1, local_y1 = component["crop_bbox_local"]
+        analysis_bbox = (
+            tray_x0 + local_x0,
+            tray_y0 + local_y0,
+            tray_x0 + local_x1,
+            tray_y0 + local_y1,
+        )
+        component_bbox = (
+            tray_x0 + component["bbox_local"][0],
+            tray_y0 + component["bbox_local"][1],
+            tray_x0 + component["bbox_local"][2],
+            tray_y0 + component["bbox_local"][3],
+        )
+        crop_bgr = image_bgr[analysis_bbox[1] : analysis_bbox[3], analysis_bbox[0] : analysis_bbox[2]]
+        component_mask_u8 = (
+            (component_labels[local_y0:local_y1, local_x0:local_x1] == int(component["label_id"])).astype(np.uint8) * 255
+        )
+        leaf_label_map, leaf_count, canopy_area_px, min_leaf_area_px = _estimate_leaf_instances(
+            component_mask_u8,
+            crop_bgr,
+            expected_groups=1,
+        )
+        site = PlantRegion(
+            name=f"Plant {idx + 1}",
+            position=_format_grid_position(int(component["row_index"]), int(component["col_index"]), chamber_profile.rows, chamber_profile.cols),
+            site_index=int(idx + 1),
+            row_index=int(component["row_index"]),
+            col_index=int(component["col_index"]),
+            bbox=component_bbox,
+        )
+        plant_traits, plant_leaf_rows = _compute_trait_rows(
+            crop_bgr=crop_bgr,
+            mask_u8=component_mask_u8,
+            leaf_label_map=leaf_label_map,
+            site=site,
+            analysis_bbox=analysis_bbox,
+            min_leaf_area_px=min_leaf_area_px,
+            tray_profile=chamber_profile,
+            container_source=container_source,
+            circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+            circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+            circle_radius_scale=circle_radius_scale,
+            tray_long_side_cm=tray_long_side_cm,
+            tray_long_side_px=tray_long_side_px,
+            pixels_per_cm=pixels_per_cm,
+            pixels_per_cm_override=pixels_per_cm_override,
+            mm_per_pixel=mm_per_pixel,
+            scale_source=scale_source,
+        )
+        plant_traits["Analysis Kind"] = ANALYSIS_KIND_GROWTH_CHAMBER
+        for leaf_row in plant_leaf_rows:
+            leaf_row["Analysis Kind"] = ANALYSIS_KIND_GROWTH_CHAMBER
+
+        plant_result = PlantLeafResult(
+            name=site.name,
+            position=site.position,
+            bbox=analysis_bbox,
+            site_bbox=component_bbox,
+            leaf_count=int(leaf_count),
+            canopy_area_px=int(canopy_area_px),
+            min_leaf_area_px=int(min_leaf_area_px),
+            mask=component_mask_u8,
+            leaf_label_map=leaf_label_map,
+            plant_traits=plant_traits,
+            leaf_traits=plant_leaf_rows,
+        )
+        plant_results.append(plant_result)
+        plant_rows.append(plant_traits)
+        leaf_rows.extend(plant_leaf_rows)
+        _draw_chamber_region_overlay(overlay_bgr, plant_result, color=_plant_color_bgr(idx, len(components)))
+
+    _draw_container_outline(overlay_bgr, tray_bbox, container_mask_u8)
+    plant_summary_df = pd.DataFrame(plant_rows)
+    leaf_detail_df = pd.DataFrame(leaf_rows)
+    counts_df = plant_summary_df[[column for column in ["Plant", "Position", "Estimated Leaves", "Canopy Area (px)"] if column in plant_summary_df.columns]].copy()
+
+    return TrayAnalysisResult(
+        image_shape=tuple(int(v) for v in image_rgb.shape[:2]),
+        overlay_rgb=cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB),
+        analysis_kind=ANALYSIS_KIND_GROWTH_CHAMBER,
+        counts_df=counts_df,
+        plant_summary_df=plant_summary_df,
+        leaf_detail_df=leaf_detail_df,
+        tray_bbox=tray_bbox,
+        tray_profile_key=GROWTH_CHAMBER_PROFILE_KEY,
+        tray_profile_name=chamber_profile.name,
+        grid_rows=chamber_profile.rows,
+        grid_cols=chamber_profile.cols,
+        container_source=container_source,
+        circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+        circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+        circle_radius_scale=circle_radius_scale,
+        tray_long_side_px=float(tray_long_side_px),
+        tray_long_side_cm=float(tray_long_side_cm),
+        pixels_per_cm=pixels_per_cm,
+        pixels_per_cm_override=pixels_per_cm_override,
+        mm_per_pixel=mm_per_pixel,
+        scale_source=scale_source,
+        plant_results=plant_results,
+        segmentation_source="Growth chamber vegetation threshold",
     )
 
 
@@ -1811,6 +1978,39 @@ def _segment_leaf_mask(crop_bgr: np.ndarray) -> np.ndarray:
     return _segment_with_opencv(crop_bgr)
 
 
+def _segment_growth_chamber_canopy_mask(crop_bgr: np.ndarray) -> np.ndarray:
+    if crop_bgr.size == 0:
+        return np.zeros(crop_bgr.shape[:2], dtype=np.uint8)
+
+    working_bgr, scale = _downscale_for_analysis(crop_bgr, MAX_PLANT_ANALYSIS_DIM)
+    hsv = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2LAB)
+    rgb = cv2.cvtColor(working_bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
+    exg = (2 * rgb[:, :, 1]) - rgb[:, :, 0] - rgb[:, :, 2]
+    red_minus_blue = rgb[:, :, 0] - rgb[:, :, 2]
+    green_minus_blue = rgb[:, :, 1] - rgb[:, :, 2]
+
+    hsv_mask = cv2.inRange(
+        hsv,
+        np.array([25, 35, 80], dtype=np.uint8),
+        np.array([60, 255, 255], dtype=np.uint8),
+    )
+    exg_mask = ((exg >= 18).astype(np.uint8) * 255)
+    red_blue_mask = ((red_minus_blue >= 0).astype(np.uint8) * 255)
+    green_blue_mask = ((green_minus_blue >= 12).astype(np.uint8) * 255)
+    lab_b_mask = ((lab[:, :, 2] >= 138).astype(np.uint8) * 255)
+
+    mask = cv2.bitwise_and(hsv_mask, exg_mask)
+    mask = cv2.bitwise_and(mask, red_blue_mask)
+    mask = cv2.bitwise_and(mask, green_blue_mask)
+    mask = cv2.bitwise_and(mask, lab_b_mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8), iterations=1)
+    if scale != 1.0:
+        mask = cv2.resize(mask, (crop_bgr.shape[1], crop_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+    return mask
+
+
 def _green_vegetation_mask(hsv: np.ndarray, lab: np.ndarray) -> np.ndarray:
     hsv_mask = cv2.inRange(
         hsv,
@@ -1933,6 +2133,88 @@ def _pcv_custom_range(image_rgb: np.ndarray, lower_thresh: list[int], upper_thre
             upper_thresh=upper_thresh,
             channel=channel,
         )
+
+
+def _extract_growth_chamber_components(
+    mask_u8: np.ndarray,
+) -> tuple[list[dict[str, object]], np.ndarray, int, int]:
+    binary = (mask_u8 > 0).astype(np.uint8)
+    if not np.any(binary):
+        return [], np.zeros(mask_u8.shape, dtype=np.int32), 0, 0
+
+    min_component_area_px = max(24, int(mask_u8.size * 0.0000025))
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    components: list[dict[str, object]] = []
+    for label_idx in range(1, num_labels):
+        area_px = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area_px < min_component_area_px:
+            continue
+        x0 = int(stats[label_idx, cv2.CC_STAT_LEFT])
+        y0 = int(stats[label_idx, cv2.CC_STAT_TOP])
+        width = int(stats[label_idx, cv2.CC_STAT_WIDTH])
+        height = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+        pad_x = max(6, int(round(width * 0.35)))
+        pad_y = max(6, int(round(height * 0.35)))
+        crop_bbox_local = (
+            max(0, x0 - pad_x),
+            max(0, y0 - pad_y),
+            min(mask_u8.shape[1], x0 + width + pad_x),
+            min(mask_u8.shape[0], y0 + height + pad_y),
+        )
+        components.append(
+            {
+                "label_id": int(label_idx),
+                "bbox_local": (x0, y0, x0 + width, y0 + height),
+                "crop_bbox_local": crop_bbox_local,
+                "centroid_x": float(centroids[label_idx, 0]),
+                "centroid_y": float(centroids[label_idx, 1]),
+                "height_px": int(height),
+                "area_px": int(area_px),
+            }
+        )
+
+    if not components:
+        return [], labels.astype(np.int32), 0, 0
+
+    grid_rows, grid_cols = _assign_growth_chamber_grid_indices(components)
+    components.sort(key=lambda component: (int(component["row_index"]), int(component["col_index"]), float(component["centroid_x"])))
+    return components, labels.astype(np.int32), int(grid_rows), int(grid_cols)
+
+
+def _assign_growth_chamber_grid_indices(components: list[dict[str, object]]) -> tuple[int, int]:
+    if not components:
+        return 0, 0
+
+    median_height = float(np.median([float(component["height_px"]) for component in components]))
+    row_tolerance_px = max(26.0, 0.85 * median_height)
+    row_groups: list[dict[str, object]] = []
+
+    for component in sorted(components, key=lambda item: float(item["centroid_y"])):
+        centroid_y = float(component["centroid_y"])
+        best_row_idx = -1
+        best_distance = float("inf")
+        for row_idx, row in enumerate(row_groups):
+            distance = abs(centroid_y - float(row["center_y"]))
+            if distance <= row_tolerance_px and distance < best_distance:
+                best_row_idx = row_idx
+                best_distance = distance
+        if best_row_idx < 0:
+            row_groups.append({"center_y": centroid_y, "members": [component]})
+        else:
+            row = row_groups[best_row_idx]
+            row["members"].append(component)
+            row["center_y"] = float(np.mean([float(member["centroid_y"]) for member in row["members"]]))
+
+    row_groups.sort(key=lambda row: float(row["center_y"]))
+    max_cols = 0
+    for row_idx, row in enumerate(row_groups):
+        members = sorted(row["members"], key=lambda item: float(item["centroid_x"]))
+        max_cols = max(max_cols, len(members))
+        for col_idx, component in enumerate(members):
+            component["row_index"] = int(row_idx)
+            component["col_index"] = int(col_idx)
+
+    return len(row_groups), max_cols
 
 
 def _estimate_leaf_instances(
@@ -2604,6 +2886,46 @@ def _draw_region_overlay(image_bgr: np.ndarray, plant_result: PlantLeafResult, c
         0.62,
         color,
         2,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_chamber_region_overlay(image_bgr: np.ndarray, plant_result: PlantLeafResult, color: tuple[int, int, int]) -> None:
+    x0, y0, x1, y1 = plant_result.bbox
+    crop = image_bgr[y0:y1, x0:x1]
+    mask = plant_result.mask
+
+    if mask.size > 0 and np.any(mask > 0):
+        overlay_layer = np.zeros_like(crop)
+        overlay_layer[:] = color
+        idx = mask > 0
+        crop[idx] = cv2.addWeighted(crop[idx], 0.68, overlay_layer[idx], 0.32, 0)
+        contours, _ = cv2.findContours((mask > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cv2.drawContours(crop, contours, -1, color, 2)
+
+    site_x0, site_y0, site_x1, site_y1 = plant_result.site_bbox
+    center_x = int(round((site_x0 + site_x1) / 2.0))
+    center_y = int(round((site_y0 + site_y1) / 2.0))
+    caption = plant_result.name.replace("Plant ", "P")
+    (caption_w, _), _ = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    caption_x = max(8, center_x - (caption_w // 2))
+    caption_y = max(18, y0 + 18)
+    cv2.rectangle(
+        image_bgr,
+        (caption_x - 5, caption_y - 14),
+        (caption_x + caption_w + 5, caption_y + 4),
+        (18, 18, 18),
+        -1,
+    )
+    cv2.putText(
+        image_bgr,
+        caption,
+        (caption_x, caption_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        color,
+        1,
         cv2.LINE_AA,
     )
 

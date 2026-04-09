@@ -7,6 +7,7 @@ Streamlit Community Cloud app for tray, chamber, and seedling phenotyping.
 - Potato / soybean `2x2` trays
 - Lettuce `2x2` trays
 - Arabidopsis `4x5` trays
+- Growth chamber level scenes with many plants
 - Universal custom grids
 - Seedlings from flat roots + shoots images
 - Linked seedling experiments with:
