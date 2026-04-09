@@ -39,6 +39,8 @@ FULL_IMAGE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_FULL_IMAGE", 
 
 SEEDLING_WORKFLOW_SINGLE = "single"
 SEEDLING_WORKFLOW_LINKED = "linked_multiview"
+DATASET_MODE_INDEPENDENT = "independent"
+DATASET_MODE_TIMESERIES = "timeseries"
 
 
 st.set_page_config(
@@ -793,7 +795,8 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
         zf.writestr("image_summary.csv", _csv_bytes(batch_payload["image_summary_df"]))
         zf.writestr("plant_summary.csv", _csv_bytes(batch_payload["plant_summary_df"]))
         zf.writestr("leaf_details.csv", _csv_bytes(batch_payload["leaf_detail_df"]))
-        zf.writestr("leaf_tracks.csv", _csv_bytes(batch_payload["leaf_tracks_df"]))
+        if not batch_payload["leaf_tracks_df"].empty:
+            zf.writestr("leaf_tracks.csv", _csv_bytes(batch_payload["leaf_tracks_df"]))
 
         for record in batch_payload["records"]:
             item = record["item"]
@@ -876,6 +879,7 @@ def _build_batch_payload(
     tray_profile_key: str,
     tray_long_side_values_cm: tuple[float, ...],
     pixels_per_cm_override_values: tuple[float | None, ...],
+    dataset_mode: str = DATASET_MODE_INDEPENDENT,
     custom_grid_rows: int | None = None,
     custom_grid_cols: int | None = None,
     custom_outer_pad_ratio: float | None = None,
@@ -962,14 +966,12 @@ def _build_batch_payload(
 
         plant_df = result.plant_summary_df.copy()
         plant_df.insert(0, "Image", item["name"])
-        if item.get("source_path"):
-            plant_df.insert(1, "Source Path", item["source_path"])
+        plant_df.insert(1, "Source Path", str(item.get("source_path", "") or ""))
         plant_frames.append(plant_df)
 
         leaf_df = result.leaf_detail_df.copy()
         leaf_df.insert(0, "Image", item["name"])
-        if item.get("source_path"):
-            leaf_df.insert(1, "Source Path", item["source_path"])
+        leaf_df.insert(1, "Source Path", str(item.get("source_path", "") or ""))
         leaf_frames.append(leaf_df)
 
         image_row = {
@@ -1007,50 +1009,54 @@ def _build_batch_payload(
     plant_summary_df = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
     leaf_detail_df = pd.concat(leaf_frames, ignore_index=True) if leaf_frames else pd.DataFrame()
     skipped_df = pd.DataFrame(skipped_items)
-    frame_metadata_df = _build_frame_metadata_df(records)
-    if not frame_metadata_df.empty:
-        image_summary_df = image_summary_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
-        if not plant_summary_df.empty:
-            plant_summary_df = plant_summary_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
-        if not leaf_detail_df.empty:
-            leaf_detail_df = leaf_detail_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
-    leaf_detail_df, leaf_tracks_df = _attach_leaf_tracks(leaf_detail_df)
-    image_summary_df = _with_leading_columns(
-        image_summary_df,
-        ["Image", "Source Path", "Frame Index", "Timepoint Label", "Timepoint Value"],
-    )
-    plant_summary_df = _with_leading_columns(
-        plant_summary_df,
-        ["Image", "Source Path", "Frame Index", "Timepoint Label", "Timepoint Value", "Plant", "Position"],
-    )
-    leaf_detail_df = _with_leading_columns(
-        leaf_detail_df,
-        [
-            "Image",
-            "Source Path",
-            "Frame Index",
-            "Timepoint Label",
-            "Timepoint Value",
-            "Plant",
-            "Position",
-            "Leaf Track ID",
-            "Leaf ID",
-        ],
-    )
-    leaf_tracks_df = _with_leading_columns(
-        leaf_tracks_df,
-        [
-            "Image",
-            "Source Path",
-            "Frame Index",
-            "Timepoint Label",
-            "Timepoint Value",
-            "Plant",
-            "Position",
-            "Leaf Track ID",
-            "Leaf ID",
-        ],
-    )
+    timeseries_enabled = dataset_mode == DATASET_MODE_TIMESERIES
+    if timeseries_enabled:
+        frame_metadata_df = _build_frame_metadata_df(records)
+        if not frame_metadata_df.empty:
+            image_summary_df = image_summary_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
+            if not plant_summary_df.empty:
+                plant_summary_df = plant_summary_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
+            if not leaf_detail_df.empty:
+                leaf_detail_df = leaf_detail_df.merge(frame_metadata_df, on=["Image", "Source Path"], how="left")
+        leaf_detail_df, leaf_tracks_df = _attach_leaf_tracks(leaf_detail_df)
+        image_summary_df = _with_leading_columns(
+            image_summary_df,
+            ["Image", "Source Path", "Frame Index", "Timepoint Label", "Timepoint Value"],
+        )
+        plant_summary_df = _with_leading_columns(
+            plant_summary_df,
+            ["Image", "Source Path", "Frame Index", "Timepoint Label", "Timepoint Value", "Plant", "Position"],
+        )
+        leaf_detail_df = _with_leading_columns(
+            leaf_detail_df,
+            [
+                "Image",
+                "Source Path",
+                "Frame Index",
+                "Timepoint Label",
+                "Timepoint Value",
+                "Plant",
+                "Position",
+                "Leaf Track ID",
+                "Leaf ID",
+            ],
+        )
+        leaf_tracks_df = _with_leading_columns(
+            leaf_tracks_df,
+            [
+                "Image",
+                "Source Path",
+                "Frame Index",
+                "Timepoint Label",
+                "Timepoint Value",
+                "Plant",
+                "Position",
+                "Leaf Track ID",
+                "Leaf ID",
+            ],
+        )
+    else:
+        leaf_tracks_df = pd.DataFrame()
 
     return {
         "records": records,
@@ -1059,12 +1065,14 @@ def _build_batch_payload(
         "leaf_detail_df": leaf_detail_df,
         "leaf_tracks_df": leaf_tracks_df,
         "skipped_df": skipped_df,
+        "dataset_mode": dataset_mode,
     }
 
 
 def _results_zip_signature(batch_payload: dict[str, Any], results_bundle_name: str) -> str:
     digest = hashlib.sha1()
     digest.update(results_bundle_name.encode("utf-8"))
+    digest.update(str(batch_payload.get("dataset_mode", DATASET_MODE_INDEPENDENT)).encode("utf-8"))
     for key in ("image_summary_df", "plant_summary_df", "leaf_detail_df", "leaf_tracks_df", "skipped_df"):
         csv_bytes = _csv_bytes(batch_payload[key]) if key in batch_payload and isinstance(batch_payload[key], pd.DataFrame) else b""
         digest.update(key.encode("utf-8"))
@@ -1087,12 +1095,14 @@ def _write_batch_outputs(output_dir_str: str, batch_payload: dict[str, Any]) -> 
         output_dir / "image_summary.csv",
         output_dir / "plant_summary.csv",
         output_dir / "leaf_details.csv",
-        output_dir / "leaf_tracks.csv",
     ]
     batch_payload["image_summary_df"].to_csv(written_paths[0], index=False)
     batch_payload["plant_summary_df"].to_csv(written_paths[1], index=False)
     batch_payload["leaf_detail_df"].to_csv(written_paths[2], index=False)
-    batch_payload["leaf_tracks_df"].to_csv(written_paths[3], index=False)
+    if not batch_payload["leaf_tracks_df"].empty:
+        leaf_tracks_path = output_dir / "leaf_tracks.csv"
+        batch_payload["leaf_tracks_df"].to_csv(leaf_tracks_path, index=False)
+        written_paths.append(leaf_tracks_path)
 
     for record in batch_payload["records"]:
         overlay_path = overlays_dir / f"{record['export_stem']}_overlay.png"
@@ -2937,6 +2947,28 @@ def main() -> None:
             )
     if zip_archive_count > 0:
         st.caption(f"Discovered {zip_image_count} image(s) across {zip_archive_count} uploaded zip archive(s).")
+
+    dataset_mode = st.radio(
+        "Dataset mode",
+        options=[DATASET_MODE_INDEPENDENT, DATASET_MODE_TIMESERIES],
+        index=0,
+        horizontal=True,
+        format_func=lambda value: {
+            DATASET_MODE_INDEPENDENT: "Independent batch",
+            DATASET_MODE_TIMESERIES: "Time series batch",
+        }.get(value, value),
+        help="Use time series mode when the uploaded images are repeated rounds of the same tray and you want frame ordering plus leaf tracking.",
+    )
+    if dataset_mode == DATASET_MODE_TIMESERIES:
+        st.caption(
+            "Time series mode sorts frames from labels like `round32`, `day5`, or `frame12`, then enables the leaf-tracking export. "
+            "Use this when one upload batch is the same tray imaged repeatedly over time."
+        )
+    else:
+        st.caption(
+            "Independent batch mode treats each image separately and skips time-series ordering and leaf tracking."
+        )
+
     if not file_items:
         st.info("Upload one or more tray or seedling images, or a zip archive of images, to analyze them together.")
         return
@@ -3085,6 +3117,7 @@ def main() -> None:
             tray_profile_key=tray_profile_key,
             tray_long_side_values_cm=tray_long_side_values_cm,
             pixels_per_cm_override_values=pixels_per_cm_override_values,
+            dataset_mode=dataset_mode,
             custom_grid_rows=custom_grid_rows,
             custom_grid_cols=custom_grid_cols,
             custom_outer_pad_ratio=(None if custom_outer_pad_pct is None else float(custom_outer_pad_pct) / 100.0),
@@ -3215,7 +3248,10 @@ def main() -> None:
         with st.expander("Batch Leaf Tracking Table", expanded=False):
             st.dataframe(leaf_tracks_df, hide_index=True, use_container_width=True, height=420)
 
-    st.caption("Upload mode supports single images, large batches of images, zip archives directly in the browser, and leaf tracking across ordered time-series batches.")
+    if dataset_mode == DATASET_MODE_TIMESERIES:
+        st.caption("Time series mode supports ordered repeated rounds of the same tray, including zip uploads and batch leaf tracking across frames.")
+    else:
+        st.caption("Independent batch mode supports single images, large batches, and zip archives directly in the browser without time-series tracking.")
     st.markdown("---")
     st.markdown(
         f"<div style='text-align:center; font-size:0.9rem; color:rgba(250,250,250,0.65);'>{FOOTER_TEXT}</div>",

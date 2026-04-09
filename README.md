@@ -18,8 +18,9 @@ Streamlit Community Cloud app for tray, chamber, and seedling phenotyping.
 Standard tray batches now support:
 
 - green and purple / anthocyanin foliage segmentation on the same tray
-- per-image frame ordering with parsed labels such as `round32`, `day5`, or `frame12`
-- batch leaf tracking across ordered uploads for the same tray sequence
+- an explicit `Dataset mode` switch between `Independent batch` and `Time series batch`
+- per-image frame ordering with parsed labels such as `round32`, `day5`, or `frame12` in time-series mode
+- batch leaf tracking across ordered uploads for the same tray sequence in time-series mode
 
 Outputs now include:
 
