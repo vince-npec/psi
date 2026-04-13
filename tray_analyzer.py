@@ -1650,6 +1650,15 @@ def _detect_container_geometry(
         )
         if rectangle_candidate is not None:
             return rectangle_candidate
+        if container_mode == CONTAINER_MODE_RECTANGLE:
+            return _default_rectangular_container_geometry(
+                image_bgr,
+                inset_ratio=0.04,
+                rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+                rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+                rectangle_width_scale=rectangle_width_scale,
+                rectangle_height_scale=rectangle_height_scale,
+            )
 
     if container_mode in {CONTAINER_MODE_AUTO, CONTAINER_MODE_CIRCLE}:
         circle_candidate = _detect_circular_container_geometry(
@@ -1723,6 +1732,49 @@ def _detect_rectangular_tray_geometry(
     )
     source = "Detected blue tray rectangle + user adjustment" if adjusted else "Detected blue tray rectangle"
     return bbox, max(1.0, float(max(x1 - x0, y1 - y0))), full_mask, source
+
+
+def _default_rectangular_container_geometry(
+    image_bgr: np.ndarray,
+    inset_ratio: float = 0.04,
+    rectangle_center_x_shift_ratio: float = 0.0,
+    rectangle_center_y_shift_ratio: float = 0.0,
+    rectangle_width_scale: float = 1.0,
+    rectangle_height_scale: float = 1.0,
+) -> tuple[tuple[int, int, int, int], float, np.ndarray, str]:
+    height, width = image_bgr.shape[:2]
+    inset_ratio = _clip_ratio(inset_ratio, 0.04, minimum=0.0, maximum=0.2)
+    base_x0 = int(round(width * inset_ratio))
+    base_y0 = int(round(height * inset_ratio))
+    base_x1 = int(round(width * (1.0 - inset_ratio)))
+    base_y1 = int(round(height * (1.0 - inset_ratio)))
+    base_w = max(30, base_x1 - base_x0)
+    base_h = max(30, base_y1 - base_y0)
+
+    center_x = float((base_x0 + base_x1) / 2.0) + (float(width) * rectangle_center_x_shift_ratio)
+    center_y = float((base_y0 + base_y1) / 2.0) + (float(height) * rectangle_center_y_shift_ratio)
+    adjusted_w = max(30, int(round(float(base_w) * rectangle_width_scale)))
+    adjusted_h = max(30, int(round(float(base_h) * rectangle_height_scale)))
+
+    x0 = int(round(center_x - (adjusted_w / 2.0)))
+    y0 = int(round(center_y - (adjusted_h / 2.0)))
+    x1 = x0 + adjusted_w
+    y1 = y0 + adjusted_h
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    x1 = min(width, x1)
+    y1 = min(height, y1)
+
+    full_mask = np.zeros((height, width), dtype=np.uint8)
+    full_mask[y0:y1, x0:x1] = 255
+    adjusted = (
+        abs(rectangle_center_x_shift_ratio) > 1e-6
+        or abs(rectangle_center_y_shift_ratio) > 1e-6
+        or abs(rectangle_width_scale - 1.0) > 1e-6
+        or abs(rectangle_height_scale - 1.0) > 1e-6
+    )
+    source = "Default tray rectangle + user adjustment" if adjusted else "Default tray rectangle"
+    return (x0, y0, x1, y1), max(1.0, float(max(x1 - x0, y1 - y0))), full_mask, source
 
 
 def _detect_circular_container_geometry(
