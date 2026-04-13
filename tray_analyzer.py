@@ -3116,10 +3116,19 @@ def _draw_container_outline(
     tray_bbox: tuple[int, int, int, int],
     container_mask_u8: np.ndarray,
 ) -> None:
-    contours, _ = cv2.findContours((container_mask_u8 > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask_u8 = (container_mask_u8 > 0).astype(np.uint8) * 255
+    outside = mask_u8 == 0
+    if np.any(outside):
+        shaded = image_bgr.copy()
+        shaded[outside] = (shaded[outside] * 0.45).astype(np.uint8)
+        image_bgr[outside] = shaded[outside]
+
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
+        cv2.drawContours(image_bgr, contours, -1, (10, 10, 10), 5)
         cv2.drawContours(image_bgr, contours, -1, (255, 255, 255), 2)
         return
 
     x0, y0, x1, y1 = tray_bbox
+    cv2.rectangle(image_bgr, (x0, y0), (x1, y1), (10, 10, 10), 5)
     cv2.rectangle(image_bgr, (x0, y0), (x1, y1), (255, 255, 255), 2)
