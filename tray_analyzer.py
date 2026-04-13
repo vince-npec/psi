@@ -129,6 +129,10 @@ class TrayAnalysisResult:
     circle_center_x_shift_ratio: float
     circle_center_y_shift_ratio: float
     circle_radius_scale: float
+    rectangle_center_x_shift_ratio: float
+    rectangle_center_y_shift_ratio: float
+    rectangle_width_scale: float
+    rectangle_height_scale: float
     tray_long_side_px: float
     tray_long_side_cm: float
     pixels_per_cm: float | None
@@ -174,6 +178,10 @@ def analyze_tray_image(
     circle_center_x_shift_ratio: float = 0.0,
     circle_center_y_shift_ratio: float = 0.0,
     circle_radius_scale: float = 1.0,
+    rectangle_center_x_shift_ratio: float = 0.0,
+    rectangle_center_y_shift_ratio: float = 0.0,
+    rectangle_width_scale: float = 1.0,
+    rectangle_height_scale: float = 1.0,
 ) -> TrayAnalysisResult:
     """Analyze a top-down tray image with adaptive ownership assignment across the full tray."""
     image_rgb = _normalize_rgb_image(image_rgb)
@@ -181,6 +189,10 @@ def analyze_tray_image(
     circle_center_x_shift_ratio = _clip_ratio(circle_center_x_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_center_y_shift_ratio = _clip_ratio(circle_center_y_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_radius_scale = _clip_ratio(circle_radius_scale, 1.0, minimum=0.2, maximum=3.0)
+    rectangle_center_x_shift_ratio = _clip_ratio(rectangle_center_x_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
+    rectangle_center_y_shift_ratio = _clip_ratio(rectangle_center_y_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
+    rectangle_width_scale = _clip_ratio(rectangle_width_scale, 1.0, minimum=0.2, maximum=3.0)
+    rectangle_height_scale = _clip_ratio(rectangle_height_scale, 1.0, minimum=0.2, maximum=3.0)
     if tray_profile_key == GROWTH_CHAMBER_PROFILE_KEY:
         return _analyze_growth_chamber_image(
             image_rgb=image_rgb,
@@ -192,6 +204,10 @@ def analyze_tray_image(
             circle_center_x_shift_ratio=circle_center_x_shift_ratio,
             circle_center_y_shift_ratio=circle_center_y_shift_ratio,
             circle_radius_scale=circle_radius_scale,
+            rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+            rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+            rectangle_width_scale=rectangle_width_scale,
+            rectangle_height_scale=rectangle_height_scale,
         )
     if tray_profile_key == SEEDLINGS_PROFILE_KEY:
         return _analyze_seedling_image(
@@ -204,6 +220,10 @@ def analyze_tray_image(
             circle_center_x_shift_ratio=circle_center_x_shift_ratio,
             circle_center_y_shift_ratio=circle_center_y_shift_ratio,
             circle_radius_scale=circle_radius_scale,
+            rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+            rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+            rectangle_width_scale=rectangle_width_scale,
+            rectangle_height_scale=rectangle_height_scale,
         )
     tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
         image_bgr,
@@ -212,6 +232,10 @@ def analyze_tray_image(
         circle_center_x_shift_ratio=circle_center_x_shift_ratio,
         circle_center_y_shift_ratio=circle_center_y_shift_ratio,
         circle_radius_scale=circle_radius_scale,
+        rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+        rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+        rectangle_width_scale=rectangle_width_scale,
+        rectangle_height_scale=rectangle_height_scale,
     )
     tray_x0, tray_y0, tray_x1, tray_y1 = tray_bbox
     tray_crop_bgr = image_bgr[tray_y0:tray_y1, tray_x0:tray_x1]
@@ -277,6 +301,10 @@ def analyze_tray_image(
             circle_center_x_shift_ratio=circle_center_x_shift_ratio,
             circle_center_y_shift_ratio=circle_center_y_shift_ratio,
             circle_radius_scale=circle_radius_scale,
+            rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+            rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+            rectangle_width_scale=rectangle_width_scale,
+            rectangle_height_scale=rectangle_height_scale,
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
@@ -324,6 +352,10 @@ def analyze_tray_image(
         circle_center_x_shift_ratio=circle_center_x_shift_ratio,
         circle_center_y_shift_ratio=circle_center_y_shift_ratio,
         circle_radius_scale=circle_radius_scale,
+        rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+        rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+        rectangle_width_scale=rectangle_width_scale,
+        rectangle_height_scale=rectangle_height_scale,
         tray_long_side_px=float(tray_long_side_px),
         tray_long_side_cm=float(tray_long_side_cm),
         pixels_per_cm=pixels_per_cm,
@@ -345,6 +377,10 @@ def _analyze_growth_chamber_image(
     circle_center_x_shift_ratio: float,
     circle_center_y_shift_ratio: float,
     circle_radius_scale: float,
+    rectangle_center_x_shift_ratio: float,
+    rectangle_center_y_shift_ratio: float,
+    rectangle_width_scale: float,
+    rectangle_height_scale: float,
 ) -> TrayAnalysisResult:
     tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
         image_bgr,
@@ -353,6 +389,10 @@ def _analyze_growth_chamber_image(
         circle_center_x_shift_ratio=circle_center_x_shift_ratio,
         circle_center_y_shift_ratio=circle_center_y_shift_ratio,
         circle_radius_scale=circle_radius_scale,
+        rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+        rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+        rectangle_width_scale=rectangle_width_scale,
+        rectangle_height_scale=rectangle_height_scale,
     )
     tray_x0, tray_y0, tray_x1, tray_y1 = tray_bbox
     chamber_crop_bgr = image_bgr[tray_y0:tray_y1, tray_x0:tray_x1]
@@ -426,6 +466,10 @@ def _analyze_growth_chamber_image(
             circle_center_x_shift_ratio=circle_center_x_shift_ratio,
             circle_center_y_shift_ratio=circle_center_y_shift_ratio,
             circle_radius_scale=circle_radius_scale,
+            rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+            rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+            rectangle_width_scale=rectangle_width_scale,
+            rectangle_height_scale=rectangle_height_scale,
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
@@ -476,6 +520,10 @@ def _analyze_growth_chamber_image(
         circle_center_x_shift_ratio=circle_center_x_shift_ratio,
         circle_center_y_shift_ratio=circle_center_y_shift_ratio,
         circle_radius_scale=circle_radius_scale,
+        rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+        rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+        rectangle_width_scale=rectangle_width_scale,
+        rectangle_height_scale=rectangle_height_scale,
         tray_long_side_px=float(tray_long_side_px),
         tray_long_side_cm=float(tray_long_side_cm),
         pixels_per_cm=pixels_per_cm,
@@ -497,6 +545,10 @@ def _analyze_seedling_image(
     circle_center_x_shift_ratio: float,
     circle_center_y_shift_ratio: float,
     circle_radius_scale: float,
+    rectangle_center_x_shift_ratio: float,
+    rectangle_center_y_shift_ratio: float,
+    rectangle_width_scale: float,
+    rectangle_height_scale: float,
 ) -> TrayAnalysisResult:
     tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
         image_bgr,
@@ -505,6 +557,10 @@ def _analyze_seedling_image(
         circle_center_x_shift_ratio=circle_center_x_shift_ratio,
         circle_center_y_shift_ratio=circle_center_y_shift_ratio,
         circle_radius_scale=circle_radius_scale,
+        rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+        rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+        rectangle_width_scale=rectangle_width_scale,
+        rectangle_height_scale=rectangle_height_scale,
     )
     pixels_per_cm_override = _normalize_optional_positive_float(pixels_per_cm_override)
     pixels_per_cm, mm_per_pixel, scale_source = _resolve_scale_calibration(
@@ -600,6 +656,10 @@ def _analyze_seedling_image(
             circle_center_x_shift_ratio=circle_center_x_shift_ratio,
             circle_center_y_shift_ratio=circle_center_y_shift_ratio,
             circle_radius_scale=circle_radius_scale,
+            rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+            rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+            rectangle_width_scale=rectangle_width_scale,
+            rectangle_height_scale=rectangle_height_scale,
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
@@ -673,6 +733,10 @@ def _analyze_seedling_image(
         circle_center_x_shift_ratio=circle_center_x_shift_ratio,
         circle_center_y_shift_ratio=circle_center_y_shift_ratio,
         circle_radius_scale=circle_radius_scale,
+        rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+        rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+        rectangle_width_scale=rectangle_width_scale,
+        rectangle_height_scale=rectangle_height_scale,
         tray_long_side_px=float(tray_long_side_px),
         tray_long_side_cm=float(tray_long_side_cm),
         pixels_per_cm=pixels_per_cm,
@@ -1570,10 +1634,20 @@ def _detect_container_geometry(
     circle_center_x_shift_ratio: float = 0.0,
     circle_center_y_shift_ratio: float = 0.0,
     circle_radius_scale: float = 1.0,
+    rectangle_center_x_shift_ratio: float = 0.0,
+    rectangle_center_y_shift_ratio: float = 0.0,
+    rectangle_width_scale: float = 1.0,
+    rectangle_height_scale: float = 1.0,
 ) -> tuple[tuple[int, int, int, int], float, np.ndarray, str]:
     """Detect a rectangular tray, circular chamber, or fall back to the full image."""
     if container_mode in {CONTAINER_MODE_AUTO, CONTAINER_MODE_RECTANGLE}:
-        rectangle_candidate = _detect_rectangular_tray_geometry(image_bgr)
+        rectangle_candidate = _detect_rectangular_tray_geometry(
+            image_bgr,
+            rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+            rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+            rectangle_width_scale=rectangle_width_scale,
+            rectangle_height_scale=rectangle_height_scale,
+        )
         if rectangle_candidate is not None:
             return rectangle_candidate
 
@@ -1596,6 +1670,10 @@ def _detect_container_geometry(
 
 def _detect_rectangular_tray_geometry(
     image_bgr: np.ndarray,
+    rectangle_center_x_shift_ratio: float = 0.0,
+    rectangle_center_y_shift_ratio: float = 0.0,
+    rectangle_width_scale: float = 1.0,
+    rectangle_height_scale: float = 1.0,
 ) -> tuple[tuple[int, int, int, int], float, np.ndarray, str] | None:
     """Find the blue tray carrier and estimate its long side in pixels."""
     height, width = image_bgr.shape[:2]
@@ -1609,7 +1687,6 @@ def _detect_rectangular_tray_geometry(
     rect = cv2.minAreaRect(contour)
     rect_w, rect_h = rect[1]
     long_side_px = float(max(rect_w, rect_h, w, h))
-    full_mask = np.zeros((height, width), dtype=np.uint8)
     if scale != 1.0:
         inv = 1.0 / scale
         x = int(round(x * inv))
@@ -1617,17 +1694,35 @@ def _detect_rectangular_tray_geometry(
         w = int(round(w * inv))
         h = int(round(h * inv))
         long_side_px = float(long_side_px * inv)
-        contour = np.round(contour.astype(np.float32) * inv).astype(np.int32)
-    else:
-        contour = contour.astype(np.int32)
     if w < 0.4 * width or h < 0.4 * height:
         return None
 
-    bbox = (max(0, x), max(0, y), min(width, x + w), min(height, y + h))
-    cv2.drawContours(full_mask, [contour], -1, 255, thickness=-1)
-    if not np.any(full_mask > 0):
-        full_mask[bbox[1] : bbox[3], bbox[0] : bbox[2]] = 255
-    return bbox, max(1.0, float(long_side_px)), full_mask, "Detected blue tray"
+    center_x = float(x + (w / 2.0)) + (float(width) * rectangle_center_x_shift_ratio)
+    center_y = float(y + (h / 2.0)) + (float(height) * rectangle_center_y_shift_ratio)
+    adjusted_w = max(30, int(round(float(w) * rectangle_width_scale)))
+    adjusted_h = max(30, int(round(float(h) * rectangle_height_scale)))
+    x0 = int(round(center_x - (adjusted_w / 2.0)))
+    y0 = int(round(center_y - (adjusted_h / 2.0)))
+    x1 = x0 + adjusted_w
+    y1 = y0 + adjusted_h
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    x1 = min(width, x1)
+    y1 = min(height, y1)
+    if x1 - x0 < 30 or y1 - y0 < 30:
+        return None
+
+    bbox = (x0, y0, x1, y1)
+    full_mask = np.zeros((height, width), dtype=np.uint8)
+    full_mask[y0:y1, x0:x1] = 255
+    adjusted = (
+        abs(rectangle_center_x_shift_ratio) > 1e-6
+        or abs(rectangle_center_y_shift_ratio) > 1e-6
+        or abs(rectangle_width_scale - 1.0) > 1e-6
+        or abs(rectangle_height_scale - 1.0) > 1e-6
+    )
+    source = "Detected blue tray rectangle + user adjustment" if adjusted else "Detected blue tray rectangle"
+    return bbox, max(1.0, float(max(x1 - x0, y1 - y0))), full_mask, source
 
 
 def _detect_circular_container_geometry(
@@ -2444,6 +2539,10 @@ def _compute_trait_rows(
     circle_center_x_shift_ratio: float,
     circle_center_y_shift_ratio: float,
     circle_radius_scale: float,
+    rectangle_center_x_shift_ratio: float,
+    rectangle_center_y_shift_ratio: float,
+    rectangle_width_scale: float,
+    rectangle_height_scale: float,
     tray_long_side_cm: float,
     tray_long_side_px: float,
     pixels_per_cm: float | None,
@@ -2496,6 +2595,10 @@ def _compute_trait_rows(
                 "Circle Center X Shift (%)": _round_or_none(circle_center_x_shift_ratio * 100.0, 2),
                 "Circle Center Y Shift (%)": _round_or_none(circle_center_y_shift_ratio * 100.0, 2),
                 "Circle Radius Scale (%)": _round_or_none(circle_radius_scale * 100.0, 2),
+                "Rectangle Center X Shift (%)": _round_or_none(rectangle_center_x_shift_ratio * 100.0, 2),
+                "Rectangle Center Y Shift (%)": _round_or_none(rectangle_center_y_shift_ratio * 100.0, 2),
+                "Rectangle Width Scale (%)": _round_or_none(rectangle_width_scale * 100.0, 2),
+                "Rectangle Height Scale (%)": _round_or_none(rectangle_height_scale * 100.0, 2),
                 "Scale Source": scale_source,
                 "Pixels Per Cm Override": pixels_per_cm_override,
                 "Leaf ID": int(leaf_id),
@@ -2558,6 +2661,10 @@ def _compute_trait_rows(
         "Circle Center X Shift (%)": _round_or_none(circle_center_x_shift_ratio * 100.0, 2),
         "Circle Center Y Shift (%)": _round_or_none(circle_center_y_shift_ratio * 100.0, 2),
         "Circle Radius Scale (%)": _round_or_none(circle_radius_scale * 100.0, 2),
+        "Rectangle Center X Shift (%)": _round_or_none(rectangle_center_x_shift_ratio * 100.0, 2),
+        "Rectangle Center Y Shift (%)": _round_or_none(rectangle_center_y_shift_ratio * 100.0, 2),
+        "Rectangle Width Scale (%)": _round_or_none(rectangle_width_scale * 100.0, 2),
+        "Rectangle Height Scale (%)": _round_or_none(rectangle_height_scale * 100.0, 2),
         "Scale Source": scale_source,
         "Tray Long Side (px)": _round_or_none(tray_long_side_px, 2),
         "Tray Long Side (cm)": float(tray_long_side_cm),

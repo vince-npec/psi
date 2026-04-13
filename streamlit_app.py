@@ -41,6 +41,8 @@ DEFAULT_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_AUTO", "auto")
 DEFAULT_TRAY_LONG_SIDE_CM = float(getattr(tray_analyzer, "TRAY_LONG_SIDE_CM", 33.0))
 ANALYSIS_KIND_SEEDLINGS = getattr(tray_analyzer, "ANALYSIS_KIND_SEEDLINGS", "seedlings")
 FULL_IMAGE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_FULL_IMAGE", "full_image")
+RECTANGLE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_RECTANGLE", "rectangle")
+CIRCLE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_CIRCLE", "circle")
 
 SEEDLING_WORKFLOW_SINGLE = "single"
 SEEDLING_WORKFLOW_LINKED = "linked_multiview"
@@ -445,6 +447,10 @@ def _analyze_upload(
     circle_center_x_shift_ratio: float = 0.0,
     circle_center_y_shift_ratio: float = 0.0,
     circle_radius_scale: float = 1.0,
+    rectangle_center_x_shift_ratio: float = 0.0,
+    rectangle_center_y_shift_ratio: float = 0.0,
+    rectangle_width_scale: float = 1.0,
+    rectangle_height_scale: float = 1.0,
 ):
     image = _open_rgb_image(image_bytes)
     return analyze_tray_image(
@@ -460,6 +466,10 @@ def _analyze_upload(
         circle_center_x_shift_ratio=circle_center_x_shift_ratio,
         circle_center_y_shift_ratio=circle_center_y_shift_ratio,
         circle_radius_scale=circle_radius_scale,
+        rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+        rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+        rectangle_width_scale=rectangle_width_scale,
+        rectangle_height_scale=rectangle_height_scale,
     )
 
 
@@ -635,6 +645,14 @@ def _coerce_circle_size_pct(value: Any) -> float:
     return float(min(300.0, max(20.0, size_pct)))
 
 
+def _coerce_rectangle_shift_pct(value: Any) -> float:
+    return _coerce_circle_shift_pct(value)
+
+
+def _coerce_rectangle_scale_pct(value: Any) -> float:
+    return _coerce_circle_size_pct(value)
+
+
 def _item_display_path(item: dict[str, Any]) -> str:
     source_path = str(item.get("source_path", "") or "").strip()
     if source_path:
@@ -718,6 +736,41 @@ def _build_circle_adjustment_editor_df(file_items: list[dict[str, Any]]) -> pd.D
         y_shift_overrides.pop(stale_key, None)
     for stale_key in [key for key in list(radius_scale_overrides) if key not in active_keys]:
         radius_scale_overrides.pop(stale_key, None)
+
+    return pd.DataFrame(rows)
+
+
+def _build_rectangle_adjustment_editor_df(file_items: list[dict[str, Any]]) -> pd.DataFrame:
+    x_shift_overrides = st.session_state.setdefault("per_image_rectangle_center_x_shift_pct", {})
+    y_shift_overrides = st.session_state.setdefault("per_image_rectangle_center_y_shift_pct", {})
+    width_scale_overrides = st.session_state.setdefault("per_image_rectangle_width_scale_pct", {})
+    height_scale_overrides = st.session_state.setdefault("per_image_rectangle_height_scale_pct", {})
+    active_keys: list[str] = []
+    rows: list[dict[str, Any]] = []
+
+    for idx, item in enumerate(file_items):
+        item_key = f"{idx}::{_item_display_path(item)}"
+        active_keys.append(item_key)
+        rows.append(
+            {
+                "_Item Key": item_key,
+                "Image": str(item["name"]),
+                "Source Path": _item_display_path(item),
+                "Rectangle X Shift (%)": _coerce_rectangle_shift_pct(x_shift_overrides.get(item_key, 0.0)),
+                "Rectangle Y Shift (%)": _coerce_rectangle_shift_pct(y_shift_overrides.get(item_key, 0.0)),
+                "Rectangle Width (%)": _coerce_rectangle_scale_pct(width_scale_overrides.get(item_key, 100.0)),
+                "Rectangle Height (%)": _coerce_rectangle_scale_pct(height_scale_overrides.get(item_key, 100.0)),
+            }
+        )
+
+    for stale_key in [key for key in list(x_shift_overrides) if key not in active_keys]:
+        x_shift_overrides.pop(stale_key, None)
+    for stale_key in [key for key in list(y_shift_overrides) if key not in active_keys]:
+        y_shift_overrides.pop(stale_key, None)
+    for stale_key in [key for key in list(width_scale_overrides) if key not in active_keys]:
+        width_scale_overrides.pop(stale_key, None)
+    for stale_key in [key for key in list(height_scale_overrides) if key not in active_keys]:
+        height_scale_overrides.pop(stale_key, None)
 
     return pd.DataFrame(rows)
 
@@ -865,6 +918,10 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
                         f"Circle X Shift (%): {round(float(result.circle_center_x_shift_ratio) * 100.0, 2)}",
                         f"Circle Y Shift (%): {round(float(result.circle_center_y_shift_ratio) * 100.0, 2)}",
                         f"Circle Size (%): {round(float(result.circle_radius_scale) * 100.0, 2)}",
+                        f"Rectangle X Shift (%): {round(float(result.rectangle_center_x_shift_ratio) * 100.0, 2)}",
+                        f"Rectangle Y Shift (%): {round(float(result.rectangle_center_y_shift_ratio) * 100.0, 2)}",
+                        f"Rectangle Width (%): {round(float(result.rectangle_width_scale) * 100.0, 2)}",
+                        f"Rectangle Height (%): {round(float(result.rectangle_height_scale) * 100.0, 2)}",
                         f"Scale Source: {result.scale_source}",
                         f"Tray Long Side (cm): {result.tray_long_side_cm}",
                         f"Tray Long Side (px): {result.tray_long_side_px}",
@@ -893,6 +950,10 @@ def _build_batch_payload(
     circle_center_x_shift_ratios: tuple[float, ...] = (),
     circle_center_y_shift_ratios: tuple[float, ...] = (),
     circle_radius_scales: tuple[float, ...] = (),
+    rectangle_center_x_shift_ratios: tuple[float, ...] = (),
+    rectangle_center_y_shift_ratios: tuple[float, ...] = (),
+    rectangle_width_scales: tuple[float, ...] = (),
+    rectangle_height_scales: tuple[float, ...] = (),
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     image_rows: list[dict[str, Any]] = []
@@ -915,8 +976,20 @@ def _build_batch_payload(
     resolved_circle_radius_scales = list(circle_radius_scales)
     if len(resolved_circle_radius_scales) != len(file_items):
         resolved_circle_radius_scales = [1.0] * len(file_items)
+    resolved_rectangle_center_x_shift_ratios = list(rectangle_center_x_shift_ratios)
+    if len(resolved_rectangle_center_x_shift_ratios) != len(file_items):
+        resolved_rectangle_center_x_shift_ratios = [0.0] * len(file_items)
+    resolved_rectangle_center_y_shift_ratios = list(rectangle_center_y_shift_ratios)
+    if len(resolved_rectangle_center_y_shift_ratios) != len(file_items):
+        resolved_rectangle_center_y_shift_ratios = [0.0] * len(file_items)
+    resolved_rectangle_width_scales = list(rectangle_width_scales)
+    if len(resolved_rectangle_width_scales) != len(file_items):
+        resolved_rectangle_width_scales = [1.0] * len(file_items)
+    resolved_rectangle_height_scales = list(rectangle_height_scales)
+    if len(resolved_rectangle_height_scales) != len(file_items):
+        resolved_rectangle_height_scales = [1.0] * len(file_items)
 
-    for item, export_stem, tray_long_side_cm, pixels_per_cm_override, circle_center_x_shift_ratio, circle_center_y_shift_ratio, circle_radius_scale in zip(
+    for item, export_stem, tray_long_side_cm, pixels_per_cm_override, circle_center_x_shift_ratio, circle_center_y_shift_ratio, circle_radius_scale, rectangle_center_x_shift_ratio, rectangle_center_y_shift_ratio, rectangle_width_scale, rectangle_height_scale in zip(
         file_items,
         export_stems,
         resolved_tray_long_side_values_cm,
@@ -924,6 +997,10 @@ def _build_batch_payload(
         resolved_circle_center_x_shift_ratios,
         resolved_circle_center_y_shift_ratios,
         resolved_circle_radius_scales,
+        resolved_rectangle_center_x_shift_ratios,
+        resolved_rectangle_center_y_shift_ratios,
+        resolved_rectangle_width_scales,
+        resolved_rectangle_height_scales,
     ):
         image_label = _item_display_path(item)
         try:
@@ -941,6 +1018,10 @@ def _build_batch_payload(
                 circle_center_x_shift_ratio=float(circle_center_x_shift_ratio),
                 circle_center_y_shift_ratio=float(circle_center_y_shift_ratio),
                 circle_radius_scale=float(circle_radius_scale),
+                rectangle_center_x_shift_ratio=float(rectangle_center_x_shift_ratio),
+                rectangle_center_y_shift_ratio=float(rectangle_center_y_shift_ratio),
+                rectangle_width_scale=float(rectangle_width_scale),
+                rectangle_height_scale=float(rectangle_height_scale),
             )
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
@@ -990,6 +1071,10 @@ def _build_batch_payload(
             "Circle X Shift (%)": round(float(result.circle_center_x_shift_ratio) * 100.0, 2),
             "Circle Y Shift (%)": round(float(result.circle_center_y_shift_ratio) * 100.0, 2),
             "Circle Size (%)": round(float(result.circle_radius_scale) * 100.0, 2),
+            "Rectangle X Shift (%)": round(float(result.rectangle_center_x_shift_ratio) * 100.0, 2),
+            "Rectangle Y Shift (%)": round(float(result.rectangle_center_y_shift_ratio) * 100.0, 2),
+            "Rectangle Width (%)": round(float(result.rectangle_width_scale) * 100.0, 2),
+            "Rectangle Height (%)": round(float(result.rectangle_height_scale) * 100.0, 2),
             "Scale Source": result.scale_source,
             "Estimated Leaves": int(result.plant_summary_df["Estimated Leaves"].sum()),
             "Total Canopy Area (px)": int(result.plant_summary_df["Canopy Area (px)"].sum()),
@@ -1367,6 +1452,14 @@ def _timeseries_metric_columns(df: pd.DataFrame) -> list[str]:
         "Circle Center X Shift (%)",
         "Circle Center Y Shift (%)",
         "Circle Radius Scale (%)",
+        "Rectangle X Shift (%)",
+        "Rectangle Y Shift (%)",
+        "Rectangle Width (%)",
+        "Rectangle Height (%)",
+        "Rectangle Center X Shift (%)",
+        "Rectangle Center Y Shift (%)",
+        "Rectangle Width Scale (%)",
+        "Rectangle Height Scale (%)",
         "Tray Long Side (px)",
         "Tray Long Side (cm)",
         "Pixels Per Cm",
@@ -2780,6 +2873,18 @@ def _render_record_detail(record: dict[str, Any]) -> None:
                 f"y {round(float(result.circle_center_y_shift_ratio) * 100.0, 1)}% | "
                 f"size {round(float(result.circle_radius_scale) * 100.0, 1)}%"
             )
+        elif (
+            abs(float(result.rectangle_center_x_shift_ratio)) > 1e-6
+            or abs(float(result.rectangle_center_y_shift_ratio)) > 1e-6
+            or abs(float(result.rectangle_width_scale) - 1.0) > 1e-6
+            or abs(float(result.rectangle_height_scale) - 1.0) > 1e-6
+        ):
+            st.caption(
+                f"Rectangle adjustment: x {round(float(result.rectangle_center_x_shift_ratio) * 100.0, 1)}% | "
+                f"y {round(float(result.rectangle_center_y_shift_ratio) * 100.0, 1)}% | "
+                f"width {round(float(result.rectangle_width_scale) * 100.0, 1)}% | "
+                f"height {round(float(result.rectangle_height_scale) * 100.0, 1)}%"
+            )
 
     export_col_1, export_col_2 = st.columns(2)
     with export_col_1:
@@ -3322,80 +3427,181 @@ def main() -> None:
         for _, row in edited_scale_df.iterrows()
     )
 
-    st.subheader("Per-Image Circular Mask Adjustment")
-    st.caption(
-        "These controls let you move or enlarge the circular container mask per image. "
-        "They matter for `Circular pot / chamber`, and are ignored for `Rectangle tray` or `Full image`."
-    )
-    circle_editor_df = _build_circle_adjustment_editor_df(file_items)
-    circle_reset_col, circle_note_col = st.columns([0.22, 0.78])
-    with circle_reset_col:
-        if st.button("Reset circle adjustments", use_container_width=True):
-            st.session_state["per_image_circle_center_x_shift_pct"] = {}
-            st.session_state["per_image_circle_center_y_shift_pct"] = {}
-            st.session_state["per_image_circle_radius_scale_pct"] = {}
-            st.rerun()
-    with circle_note_col:
-        st.caption("Positive X moves right, positive Y moves down, and size above `100%` makes the circle larger.")
+    circle_center_x_shift_ratios: tuple[float, ...] = ()
+    circle_center_y_shift_ratios: tuple[float, ...] = ()
+    circle_radius_scales: tuple[float, ...] = ()
+    rectangle_center_x_shift_ratios: tuple[float, ...] = ()
+    rectangle_center_y_shift_ratios: tuple[float, ...] = ()
+    rectangle_width_scales: tuple[float, ...] = ()
+    rectangle_height_scales: tuple[float, ...] = ()
 
-    edited_circle_df = st.data_editor(
-        circle_editor_df,
-        hide_index=True,
-        use_container_width=True,
-        key="per_image_circle_editor",
-        disabled=["_Item Key", "Image", "Source Path"],
-        column_config={
-            "_Item Key": None,
-            "Circle X Shift (%)": st.column_config.NumberColumn(
-                "Circle X Shift (%)",
-                min_value=-75.0,
-                max_value=75.0,
-                step=1.0,
-                format="%.1f",
-                help="Shift the detected circle horizontally as a percent of image width.",
-            ),
-            "Circle Y Shift (%)": st.column_config.NumberColumn(
-                "Circle Y Shift (%)",
-                min_value=-75.0,
-                max_value=75.0,
-                step=1.0,
-                format="%.1f",
-                help="Shift the detected circle vertically as a percent of image height.",
-            ),
-            "Circle Size (%)": st.column_config.NumberColumn(
-                "Circle Size (%)",
-                min_value=20.0,
-                max_value=300.0,
-                step=1.0,
-                format="%.1f",
-                help="Scale the detected circle radius. `100%` keeps the original size.",
-            ),
-        },
-    )
-    st.session_state["per_image_circle_center_x_shift_pct"] = {
-        str(row["_Item Key"]): _coerce_circle_shift_pct(row.get("Circle X Shift (%)"))
-        for _, row in edited_circle_df.iterrows()
-    }
-    st.session_state["per_image_circle_center_y_shift_pct"] = {
-        str(row["_Item Key"]): _coerce_circle_shift_pct(row.get("Circle Y Shift (%)"))
-        for _, row in edited_circle_df.iterrows()
-    }
-    st.session_state["per_image_circle_radius_scale_pct"] = {
-        str(row["_Item Key"]): _coerce_circle_size_pct(row.get("Circle Size (%)"))
-        for _, row in edited_circle_df.iterrows()
-    }
-    circle_center_x_shift_ratios = tuple(
-        _coerce_circle_shift_pct(row.get("Circle X Shift (%)")) / 100.0
-        for _, row in edited_circle_df.iterrows()
-    )
-    circle_center_y_shift_ratios = tuple(
-        _coerce_circle_shift_pct(row.get("Circle Y Shift (%)")) / 100.0
-        for _, row in edited_circle_df.iterrows()
-    )
-    circle_radius_scales = tuple(
-        _coerce_circle_size_pct(row.get("Circle Size (%)")) / 100.0
-        for _, row in edited_circle_df.iterrows()
-    )
+    if container_mode == CIRCLE_CONTAINER_MODE:
+        st.subheader("Per-Image Circular Mask Adjustment")
+        st.caption(
+            "These controls let you move or enlarge the circular container mask per image."
+        )
+        circle_editor_df = _build_circle_adjustment_editor_df(file_items)
+        circle_reset_col, circle_note_col = st.columns([0.22, 0.78])
+        with circle_reset_col:
+            if st.button("Reset circle adjustments", use_container_width=True):
+                st.session_state["per_image_circle_center_x_shift_pct"] = {}
+                st.session_state["per_image_circle_center_y_shift_pct"] = {}
+                st.session_state["per_image_circle_radius_scale_pct"] = {}
+                st.rerun()
+        with circle_note_col:
+            st.caption("Positive X moves right, positive Y moves down, and size above `100%` makes the circle larger.")
+
+        edited_circle_df = st.data_editor(
+            circle_editor_df,
+            hide_index=True,
+            use_container_width=True,
+            key="per_image_circle_editor",
+            disabled=["_Item Key", "Image", "Source Path"],
+            column_config={
+                "_Item Key": None,
+                "Circle X Shift (%)": st.column_config.NumberColumn(
+                    "Circle X Shift (%)",
+                    min_value=-75.0,
+                    max_value=75.0,
+                    step=1.0,
+                    format="%.1f",
+                    help="Shift the detected circle horizontally as a percent of image width.",
+                ),
+                "Circle Y Shift (%)": st.column_config.NumberColumn(
+                    "Circle Y Shift (%)",
+                    min_value=-75.0,
+                    max_value=75.0,
+                    step=1.0,
+                    format="%.1f",
+                    help="Shift the detected circle vertically as a percent of image height.",
+                ),
+                "Circle Size (%)": st.column_config.NumberColumn(
+                    "Circle Size (%)",
+                    min_value=20.0,
+                    max_value=300.0,
+                    step=1.0,
+                    format="%.1f",
+                    help="Scale the detected circle radius. `100%` keeps the original size.",
+                ),
+            },
+        )
+        st.session_state["per_image_circle_center_x_shift_pct"] = {
+            str(row["_Item Key"]): _coerce_circle_shift_pct(row.get("Circle X Shift (%)"))
+            for _, row in edited_circle_df.iterrows()
+        }
+        st.session_state["per_image_circle_center_y_shift_pct"] = {
+            str(row["_Item Key"]): _coerce_circle_shift_pct(row.get("Circle Y Shift (%)"))
+            for _, row in edited_circle_df.iterrows()
+        }
+        st.session_state["per_image_circle_radius_scale_pct"] = {
+            str(row["_Item Key"]): _coerce_circle_size_pct(row.get("Circle Size (%)"))
+            for _, row in edited_circle_df.iterrows()
+        }
+        circle_center_x_shift_ratios = tuple(
+            _coerce_circle_shift_pct(row.get("Circle X Shift (%)")) / 100.0
+            for _, row in edited_circle_df.iterrows()
+        )
+        circle_center_y_shift_ratios = tuple(
+            _coerce_circle_shift_pct(row.get("Circle Y Shift (%)")) / 100.0
+            for _, row in edited_circle_df.iterrows()
+        )
+        circle_radius_scales = tuple(
+            _coerce_circle_size_pct(row.get("Circle Size (%)")) / 100.0
+            for _, row in edited_circle_df.iterrows()
+        )
+    elif container_mode == RECTANGLE_CONTAINER_MODE:
+        st.subheader("Per-Image Rectangular Mask Adjustment")
+        st.caption(
+            "These controls let you move and resize the rectangular tray mask per image."
+        )
+        rectangle_editor_df = _build_rectangle_adjustment_editor_df(file_items)
+        rectangle_reset_col, rectangle_note_col = st.columns([0.22, 0.78])
+        with rectangle_reset_col:
+            if st.button("Reset rectangle adjustments", use_container_width=True):
+                st.session_state["per_image_rectangle_center_x_shift_pct"] = {}
+                st.session_state["per_image_rectangle_center_y_shift_pct"] = {}
+                st.session_state["per_image_rectangle_width_scale_pct"] = {}
+                st.session_state["per_image_rectangle_height_scale_pct"] = {}
+                st.rerun()
+        with rectangle_note_col:
+            st.caption("Positive X moves right, positive Y moves down, and width or height above `100%` makes the rectangle larger.")
+
+        edited_rectangle_df = st.data_editor(
+            rectangle_editor_df,
+            hide_index=True,
+            use_container_width=True,
+            key="per_image_rectangle_editor",
+            disabled=["_Item Key", "Image", "Source Path"],
+            column_config={
+                "_Item Key": None,
+                "Rectangle X Shift (%)": st.column_config.NumberColumn(
+                    "Rectangle X Shift (%)",
+                    min_value=-75.0,
+                    max_value=75.0,
+                    step=1.0,
+                    format="%.1f",
+                    help="Shift the detected tray rectangle horizontally as a percent of image width.",
+                ),
+                "Rectangle Y Shift (%)": st.column_config.NumberColumn(
+                    "Rectangle Y Shift (%)",
+                    min_value=-75.0,
+                    max_value=75.0,
+                    step=1.0,
+                    format="%.1f",
+                    help="Shift the detected tray rectangle vertically as a percent of image height.",
+                ),
+                "Rectangle Width (%)": st.column_config.NumberColumn(
+                    "Rectangle Width (%)",
+                    min_value=20.0,
+                    max_value=300.0,
+                    step=1.0,
+                    format="%.1f",
+                    help="Scale the detected tray width. `100%` keeps the original width.",
+                ),
+                "Rectangle Height (%)": st.column_config.NumberColumn(
+                    "Rectangle Height (%)",
+                    min_value=20.0,
+                    max_value=300.0,
+                    step=1.0,
+                    format="%.1f",
+                    help="Scale the detected tray height. `100%` keeps the original height.",
+                ),
+            },
+        )
+        st.session_state["per_image_rectangle_center_x_shift_pct"] = {
+            str(row["_Item Key"]): _coerce_rectangle_shift_pct(row.get("Rectangle X Shift (%)"))
+            for _, row in edited_rectangle_df.iterrows()
+        }
+        st.session_state["per_image_rectangle_center_y_shift_pct"] = {
+            str(row["_Item Key"]): _coerce_rectangle_shift_pct(row.get("Rectangle Y Shift (%)"))
+            for _, row in edited_rectangle_df.iterrows()
+        }
+        st.session_state["per_image_rectangle_width_scale_pct"] = {
+            str(row["_Item Key"]): _coerce_rectangle_scale_pct(row.get("Rectangle Width (%)"))
+            for _, row in edited_rectangle_df.iterrows()
+        }
+        st.session_state["per_image_rectangle_height_scale_pct"] = {
+            str(row["_Item Key"]): _coerce_rectangle_scale_pct(row.get("Rectangle Height (%)"))
+            for _, row in edited_rectangle_df.iterrows()
+        }
+        rectangle_center_x_shift_ratios = tuple(
+            _coerce_rectangle_shift_pct(row.get("Rectangle X Shift (%)")) / 100.0
+            for _, row in edited_rectangle_df.iterrows()
+        )
+        rectangle_center_y_shift_ratios = tuple(
+            _coerce_rectangle_shift_pct(row.get("Rectangle Y Shift (%)")) / 100.0
+            for _, row in edited_rectangle_df.iterrows()
+        )
+        rectangle_width_scales = tuple(
+            _coerce_rectangle_scale_pct(row.get("Rectangle Width (%)")) / 100.0
+            for _, row in edited_rectangle_df.iterrows()
+        )
+        rectangle_height_scales = tuple(
+            _coerce_rectangle_scale_pct(row.get("Rectangle Height (%)")) / 100.0
+            for _, row in edited_rectangle_df.iterrows()
+        )
+    else:
+        st.caption("Manual mask tuning is available when `Container geometry` is set to `Rectangle tray` or `Circular pot / chamber`.")
 
     with st.spinner(f"Analyzing {len(file_items)} image(s)..."):
         batch_payload = _build_batch_payload(
@@ -3412,6 +3618,10 @@ def main() -> None:
             circle_center_x_shift_ratios=circle_center_x_shift_ratios,
             circle_center_y_shift_ratios=circle_center_y_shift_ratios,
             circle_radius_scales=circle_radius_scales,
+            rectangle_center_x_shift_ratios=rectangle_center_x_shift_ratios,
+            rectangle_center_y_shift_ratios=rectangle_center_y_shift_ratios,
+            rectangle_width_scales=rectangle_width_scales,
+            rectangle_height_scales=rectangle_height_scales,
         )
     results_bundle_name = _results_bundle_name(file_items)
     results_zip_signature = _results_zip_signature(batch_payload, results_bundle_name)
