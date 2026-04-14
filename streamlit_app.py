@@ -5,6 +5,7 @@ import hashlib
 import io
 import re
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -442,8 +443,7 @@ def _infer_top_view_seedling_regions_from_onnx(
     return regions, center_ratios, union_mask_u8
 
 
-@st.cache_data(show_spinner=False, max_entries=12)
-def _analyze_upload(
+def _analyze_upload_full(
     image_bytes: bytes,
     tray_profile_key: str,
     tray_long_side_cm: float,
@@ -482,6 +482,53 @@ def _analyze_upload(
         rectangle_height_scale=rectangle_height_scale,
         color_calibration_mode=color_calibration_mode,
     )
+
+
+def _slim_batch_result(result):
+    overlay_preview = _resize_for_preview(result.overlay_rgb, MAX_PREVIEW_EDGE)
+    return replace(result, overlay_rgb=overlay_preview, plant_results=[])
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def _analyze_upload(
+    image_bytes: bytes,
+    tray_profile_key: str,
+    tray_long_side_cm: float,
+    pixels_per_cm_override: float | None = None,
+    custom_grid_rows: int | None = None,
+    custom_grid_cols: int | None = None,
+    custom_outer_pad_ratio: float | None = None,
+    custom_site_pad_ratio: float | None = None,
+    container_mode: str = DEFAULT_CONTAINER_MODE,
+    circle_center_x_shift_ratio: float = 0.0,
+    circle_center_y_shift_ratio: float = 0.0,
+    circle_radius_scale: float = 1.0,
+    rectangle_center_x_shift_ratio: float = 0.0,
+    rectangle_center_y_shift_ratio: float = 0.0,
+    rectangle_width_scale: float = 1.0,
+    rectangle_height_scale: float = 1.0,
+    color_calibration_mode: str = DEFAULT_COLOR_CALIBRATION_MODE,
+):
+    full_result = _analyze_upload_full(
+        image_bytes=image_bytes,
+        tray_profile_key=tray_profile_key,
+        tray_long_side_cm=tray_long_side_cm,
+        pixels_per_cm_override=pixels_per_cm_override,
+        custom_grid_rows=custom_grid_rows,
+        custom_grid_cols=custom_grid_cols,
+        custom_outer_pad_ratio=custom_outer_pad_ratio,
+        custom_site_pad_ratio=custom_site_pad_ratio,
+        container_mode=container_mode,
+        circle_center_x_shift_ratio=circle_center_x_shift_ratio,
+        circle_center_y_shift_ratio=circle_center_y_shift_ratio,
+        circle_radius_scale=circle_radius_scale,
+        rectangle_center_x_shift_ratio=rectangle_center_x_shift_ratio,
+        rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
+        rectangle_width_scale=rectangle_width_scale,
+        rectangle_height_scale=rectangle_height_scale,
+        color_calibration_mode=color_calibration_mode,
+    )
+    return _slim_batch_result(full_result)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -870,7 +917,7 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
         for record in batch_payload["records"]:
             item = record["item"]
             image_bytes = _get_item_bytes(item)
-            result = record["result"]
+            result = _analyze_upload_full(image_bytes=image_bytes, **record["analysis_kwargs"])
             export_stem = str(record["export_stem"])
             source_path = str(record.get("source_path", "") or record["name"])
 
@@ -1018,27 +1065,27 @@ def _build_batch_payload(
         resolved_rectangle_height_scales,
     ):
         image_label = _item_display_path(item)
+        analysis_kwargs = {
+            "tray_profile_key": tray_profile_key,
+            "tray_long_side_cm": _coerce_tray_long_side_cm(tray_long_side_cm, DEFAULT_TRAY_LONG_SIDE_CM),
+            "pixels_per_cm_override": _coerce_optional_pixels_per_cm(pixels_per_cm_override),
+            "custom_grid_rows": custom_grid_rows,
+            "custom_grid_cols": custom_grid_cols,
+            "custom_outer_pad_ratio": custom_outer_pad_ratio,
+            "custom_site_pad_ratio": custom_site_pad_ratio,
+            "container_mode": container_mode,
+            "circle_center_x_shift_ratio": float(circle_center_x_shift_ratio),
+            "circle_center_y_shift_ratio": float(circle_center_y_shift_ratio),
+            "circle_radius_scale": float(circle_radius_scale),
+            "rectangle_center_x_shift_ratio": float(rectangle_center_x_shift_ratio),
+            "rectangle_center_y_shift_ratio": float(rectangle_center_y_shift_ratio),
+            "rectangle_width_scale": float(rectangle_width_scale),
+            "rectangle_height_scale": float(rectangle_height_scale),
+            "color_calibration_mode": str(color_calibration_mode),
+        }
         try:
             image_bytes = _get_item_bytes(item)
-            result = _analyze_upload(
-                image_bytes,
-                tray_profile_key,
-                _coerce_tray_long_side_cm(tray_long_side_cm, DEFAULT_TRAY_LONG_SIDE_CM),
-                _coerce_optional_pixels_per_cm(pixels_per_cm_override),
-                custom_grid_rows=custom_grid_rows,
-                custom_grid_cols=custom_grid_cols,
-                custom_outer_pad_ratio=custom_outer_pad_ratio,
-                custom_site_pad_ratio=custom_site_pad_ratio,
-                container_mode=container_mode,
-                circle_center_x_shift_ratio=float(circle_center_x_shift_ratio),
-                circle_center_y_shift_ratio=float(circle_center_y_shift_ratio),
-                circle_radius_scale=float(circle_radius_scale),
-                rectangle_center_x_shift_ratio=float(rectangle_center_x_shift_ratio),
-                rectangle_center_y_shift_ratio=float(rectangle_center_y_shift_ratio),
-                rectangle_width_scale=float(rectangle_width_scale),
-                rectangle_height_scale=float(rectangle_height_scale),
-                color_calibration_mode=str(color_calibration_mode),
-            )
+            result = _analyze_upload(image_bytes=image_bytes, **analysis_kwargs)
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
                 {
@@ -1063,6 +1110,7 @@ def _build_batch_payload(
             "item": item,
             "result": result,
             "source_path": item.get("source_path", ""),
+            "analysis_kwargs": analysis_kwargs,
         }
         records.append(record)
 
@@ -1214,8 +1262,12 @@ def _write_batch_outputs(output_dir_str: str, batch_payload: dict[str, Any]) -> 
         written_paths.append(leaf_tracks_path)
 
     for record in batch_payload["records"]:
+        full_result = _analyze_upload_full(
+            image_bytes=_get_item_bytes(record["item"]),
+            **record["analysis_kwargs"],
+        )
         overlay_path = overlays_dir / f"{record['export_stem']}_overlay.png"
-        Image.fromarray(record["result"].overlay_rgb).save(overlay_path)
+        Image.fromarray(full_result.overlay_rgb).save(overlay_path)
         written_paths.append(overlay_path)
 
     return written_paths
