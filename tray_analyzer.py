@@ -37,6 +37,7 @@ ANALYSIS_KIND_SEEDLINGS = "seedlings"
 ANALYSIS_KIND_GROWTH_CHAMBER = "growth_chamber"
 COLOR_CALIBRATION_DISABLED = "disabled"
 COLOR_CALIBRATION_AUTO = "auto"
+COLOR_CALIBRATION_REFERENCE = "reference_image"
 TRAY_LONG_SIDE_CM = 33.0
 MAX_TRAY_ANALYSIS_DIM = 1400
 MAX_PLANT_ANALYSIS_DIM = 3000
@@ -184,6 +185,7 @@ def get_color_calibration_options() -> list[tuple[str, str]]:
     return [
         (COLOR_CALIBRATION_DISABLED, "Disabled"),
         (COLOR_CALIBRATION_AUTO, "Auto-detect ColorChecker Classic"),
+        (COLOR_CALIBRATION_REFERENCE, "Use separate ColorChecker reference image"),
     ]
 
 
@@ -206,6 +208,7 @@ def analyze_tray_image(
     rectangle_width_scale: float = 1.0,
     rectangle_height_scale: float = 1.0,
     color_calibration_mode: str = COLOR_CALIBRATION_DISABLED,
+    color_calibration_reference: dict[str, object] | None = None,
 ) -> TrayAnalysisResult:
     """Analyze a top-down tray image with adaptive ownership assignment across the full tray."""
     image_rgb = _normalize_rgb_image(image_rgb)
@@ -213,6 +216,7 @@ def analyze_tray_image(
     color_stats_bgr, color_calibration_applied, color_calibration_source, color_calibration_loss = _apply_color_checker_calibration(
         image_bgr,
         mode=color_calibration_mode,
+        calibration_reference=color_calibration_reference,
     )
     circle_center_x_shift_ratio = _clip_ratio(circle_center_x_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_center_y_shift_ratio = _clip_ratio(circle_center_y_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
@@ -2612,38 +2616,80 @@ def _downscale_for_analysis(image: np.ndarray, max_dim: int) -> tuple[np.ndarray
 def _apply_color_checker_calibration(
     image_bgr: np.ndarray,
     mode: str = COLOR_CALIBRATION_DISABLED,
+    calibration_reference: dict[str, object] | None = None,
 ) -> tuple[np.ndarray, bool, str, float | None]:
+    if mode == COLOR_CALIBRATION_REFERENCE:
+        if not calibration_reference:
+            return image_bgr, False, "Reference ColorChecker image not provided", None
+        try:
+            matrix = np.asarray(calibration_reference.get("matrix"), dtype=np.float32)
+            bias = np.asarray(calibration_reference.get("bias"), dtype=np.float32)
+        except Exception:
+            return image_bgr, False, "Reference ColorChecker transform unavailable", None
+        if matrix.shape != (3, 3) or bias.shape != (3,):
+            return image_bgr, False, "Reference ColorChecker transform unavailable", None
+        corrected_bgr = _apply_affine_color_transform(image_bgr, matrix, bias)
+        loss_value = calibration_reference.get("loss")
+        try:
+            fit_loss = None if loss_value is None else float(loss_value)
+        except (TypeError, ValueError):
+            fit_loss = None
+        source = str(calibration_reference.get("source") or "Reference ColorChecker Classic")
+        return corrected_bgr, True, source, fit_loss
+
     if mode != COLOR_CALIBRATION_AUTO:
         return image_bgr, False, "Disabled", None
+    fit_result, source, fit_loss = _detect_color_checker_reference_from_bgr(image_bgr)
+    if fit_result is None:
+        return image_bgr, False, source, fit_loss
+    corrected_bgr = _apply_affine_color_transform(image_bgr, fit_result["matrix"], fit_result["bias"])
+    return corrected_bgr, True, source, fit_loss
+
+
+def derive_color_checker_reference_transform(image_rgb: np.ndarray) -> tuple[dict[str, object] | None, str, float | None]:
+    image_rgb = _normalize_rgb_image(image_rgb)
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    fit_result, source, fit_loss = _detect_color_checker_reference_from_bgr(image_bgr)
+    if fit_result is None:
+        return None, source, fit_loss
+    reference_transform = {
+        "matrix": np.asarray(fit_result["matrix"], dtype=np.float32).tolist(),
+        "bias": np.asarray(fit_result["bias"], dtype=np.float32).tolist(),
+        "loss": None if fit_loss is None else float(fit_loss),
+        "source": f"Reference {source}",
+        "layout_label": str(fit_result["layout_label"]),
+        "rotation": int(fit_result["rotation"]),
+    }
+    return reference_transform, str(reference_transform["source"]), fit_loss
+
+
+def _detect_color_checker_reference_from_bgr(
+    image_bgr: np.ndarray,
+) -> tuple[dict[str, object] | None, str, float | None]:
     if not hasattr(cv2, "mcc"):
-        return image_bgr, False, "OpenCV ColorChecker detector unavailable", None
+        return None, "OpenCV ColorChecker detector unavailable", None
 
     working_bgr, _ = _downscale_for_analysis(image_bgr, MAX_COLOR_CHECKER_ANALYSIS_DIM)
     try:
         detector = cv2.mcc.CCheckerDetector_create()
         detected = detector.process(working_bgr, cv2.mcc.MCC24, 1)
     except Exception:
-        return image_bgr, False, "ColorChecker detection failed", None
+        return None, "ColorChecker detection failed", None
 
     if not detected:
-        return image_bgr, False, "No ColorChecker detected", None
+        return None, "No ColorChecker detected", None
 
     checker = detector.getBestColorChecker()
     fit_result = _fit_color_checker_affine_transform(checker)
     if fit_result is None:
-        return image_bgr, False, "ColorChecker detected but calibration fit failed", None
+        return None, "ColorChecker detected but calibration fit failed", None
 
     fit_loss = float(fit_result["loss"])
     if not np.isfinite(fit_loss) or fit_loss > 0.14:
-        return image_bgr, False, "ColorChecker detected but calibration rejected", fit_loss
+        return None, "ColorChecker detected but calibration rejected", fit_loss
 
-    corrected_bgr = _apply_affine_color_transform(
-        image_bgr,
-        fit_result["matrix"],
-        fit_result["bias"],
-    )
     source = f"Detected ColorChecker Classic ({fit_result['layout_label']}, rotation {int(fit_result['rotation'])})"
-    return corrected_bgr, True, source, fit_loss
+    return fit_result, source, fit_loss
 
 
 def _fit_color_checker_affine_transform(checker: object | None) -> dict[str, object] | None:

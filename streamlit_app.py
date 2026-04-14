@@ -43,6 +43,7 @@ FULL_IMAGE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_FULL_IMAGE", 
 RECTANGLE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_RECTANGLE", "rectangle")
 CIRCLE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_CIRCLE", "circle")
 DEFAULT_COLOR_CALIBRATION_MODE = getattr(tray_analyzer, "COLOR_CALIBRATION_DISABLED", "disabled")
+REFERENCE_COLOR_CALIBRATION_MODE = getattr(tray_analyzer, "COLOR_CALIBRATION_REFERENCE", "reference_image")
 
 SEEDLING_WORKFLOW_SINGLE = "single"
 SEEDLING_WORKFLOW_LINKED = "linked_multiview"
@@ -461,6 +462,7 @@ def _analyze_upload_full(
     rectangle_width_scale: float = 1.0,
     rectangle_height_scale: float = 1.0,
     color_calibration_mode: str = DEFAULT_COLOR_CALIBRATION_MODE,
+    color_calibration_reference: dict[str, Any] | None = None,
 ):
     image = _open_rgb_image(image_bytes)
     return analyze_tray_image(
@@ -481,6 +483,7 @@ def _analyze_upload_full(
         rectangle_width_scale=rectangle_width_scale,
         rectangle_height_scale=rectangle_height_scale,
         color_calibration_mode=color_calibration_mode,
+        color_calibration_reference=color_calibration_reference,
     )
 
 
@@ -508,6 +511,7 @@ def _analyze_upload(
     rectangle_width_scale: float = 1.0,
     rectangle_height_scale: float = 1.0,
     color_calibration_mode: str = DEFAULT_COLOR_CALIBRATION_MODE,
+    color_calibration_reference: dict[str, Any] | None = None,
 ):
     full_result = _analyze_upload_full(
         image_bytes=image_bytes,
@@ -527,8 +531,21 @@ def _analyze_upload(
         rectangle_width_scale=rectangle_width_scale,
         rectangle_height_scale=rectangle_height_scale,
         color_calibration_mode=color_calibration_mode,
+        color_calibration_reference=color_calibration_reference,
     )
     return _slim_batch_result(full_result)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _derive_reference_color_calibration(image_bytes: bytes) -> dict[str, Any]:
+    image = _open_rgb_image(image_bytes)
+    transform, source, loss = tray_analyzer.derive_color_checker_reference_transform(np.array(image))
+    return {
+        "transform": transform,
+        "source": source,
+        "loss": loss,
+        "applied": transform is not None,
+    }
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -1016,6 +1033,7 @@ def _build_batch_payload(
     rectangle_width_scales: tuple[float, ...] = (),
     rectangle_height_scales: tuple[float, ...] = (),
     color_calibration_mode: str = DEFAULT_COLOR_CALIBRATION_MODE,
+    color_calibration_reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     image_rows: list[dict[str, Any]] = []
@@ -1082,6 +1100,7 @@ def _build_batch_payload(
             "rectangle_width_scale": float(rectangle_width_scale),
             "rectangle_height_scale": float(rectangle_height_scale),
             "color_calibration_mode": str(color_calibration_mode),
+            "color_calibration_reference": color_calibration_reference,
         }
         try:
             image_bytes = _get_item_bytes(item)
@@ -3303,8 +3322,13 @@ def main() -> None:
         ),
         format_func=lambda key: COLOR_CALIBRATION_LABELS.get(key, key),
     )
+    color_calibration_reference: dict[str, Any] | None = None
     with calibration_col_2:
-        if color_calibration_mode != DEFAULT_COLOR_CALIBRATION_MODE:
+        if color_calibration_mode == REFERENCE_COLOR_CALIBRATION_MODE:
+            st.caption(
+                "Upload one ColorChecker-only reference image, then reuse that fitted correction across the plant images in this run."
+            )
+        elif color_calibration_mode != DEFAULT_COLOR_CALIBRATION_MODE:
             st.caption(
                 "When a ColorChecker Classic is visible, the app fits a per-image color correction before computing canopy and leaf color traits."
             )
@@ -3312,6 +3336,29 @@ def main() -> None:
             st.caption(
                 "Leave this disabled for regular runs. Turn it on when each image includes a ColorChecker Classic target and you want more stable color traits across settings."
             )
+    if color_calibration_mode == REFERENCE_COLOR_CALIBRATION_MODE:
+        calibration_types = sorted(ext.lstrip(".") for ext in SUPPORTED_IMAGE_EXTENSIONS)
+        reference_upload = st.file_uploader(
+            "ColorChecker reference image",
+            type=calibration_types,
+            accept_multiple_files=False,
+            key="color_calibration_reference_upload",
+            help="Upload a single image that shows the ColorChecker target clearly. That fitted correction will then be applied to the plant images in this batch.",
+        )
+        if reference_upload is not None:
+            reference_result = _derive_reference_color_calibration(reference_upload.getvalue())
+            if reference_result["applied"]:
+                color_calibration_reference = reference_result["transform"]
+                loss_suffix = (
+                    f" | patch fit loss {round(float(reference_result['loss']), 4)}"
+                    if reference_result["loss"] is not None
+                    else ""
+                )
+                st.success(f"Reference calibration ready from `{reference_upload.name}`. {reference_result['source']}{loss_suffix}")
+            else:
+                st.warning(
+                    f"`{reference_upload.name}` could not be used for ColorChecker calibration. {reference_result['source']}"
+                )
     if tray_profile_key == DEFAULT_TRAY_PROFILE_KEY:
         st.caption("Auto layout chooses between a 4-plant 2x2 tray and a 20-plant 4x5 Arabidopsis tray from the canopy pattern.")
     if tray_profile_key == LETTUCE_2X2_PROFILE_KEY:
@@ -3458,6 +3505,11 @@ def main() -> None:
         st.caption(
             "Independent batch mode treats each image separately and skips time-series ordering and leaf tracking."
         )
+
+    if color_calibration_mode == REFERENCE_COLOR_CALIBRATION_MODE and color_calibration_reference is None:
+        st.info("Upload one ColorChecker reference image above. The plant-image batch will run after that calibration is ready.")
+        if file_items:
+            return
 
     if not file_items:
         st.info("Upload one or more tray or seedling images, or a zip archive of images, to analyze them together.")
@@ -3722,6 +3774,7 @@ def main() -> None:
             rectangle_width_scales=rectangle_width_scales,
             rectangle_height_scales=rectangle_height_scales,
             color_calibration_mode=color_calibration_mode,
+            color_calibration_reference=color_calibration_reference,
         )
     results_bundle_name = _results_bundle_name(file_items)
     results_zip_signature = _results_zip_signature(batch_payload, results_bundle_name)
