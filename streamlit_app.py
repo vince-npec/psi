@@ -14,10 +14,6 @@ import pandas as pd
 import altair as alt
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
-try:
-    import onnxruntime as ort
-except Exception:  # pragma: no cover - optional dependency in local dev
-    ort = None
 
 try:
     from . import tray_analyzer
@@ -78,6 +74,14 @@ LEAF_TRACK_MAX_DISTANCE_MULTIPLIER = 2.6
 LEAF_TRACK_AREA_LOG_WEIGHT = 0.28
 
 
+def _import_onnxruntime():
+    try:
+        import onnxruntime as ort  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency in local dev
+        return None
+    return ort
+
+
 def _open_rgb_image(image_bytes: bytes) -> Image.Image:
     image = Image.open(io.BytesIO(image_bytes))
     image.load()
@@ -86,6 +90,7 @@ def _open_rgb_image(image_bytes: bytes) -> Image.Image:
 
 @st.cache_resource(show_spinner=False)
 def _load_top_view_onnx_model() -> dict[str, Any] | None:
+    ort = _import_onnxruntime()
     if ort is None or not TOP_VIEW_ONNX_MODEL_PATH.exists():
         return None
 
@@ -107,6 +112,7 @@ def _load_top_view_onnx_model() -> dict[str, Any] | None:
 
 @st.cache_resource(show_spinner=False)
 def _load_flat_root_onnx_model() -> dict[str, Any] | None:
+    ort = _import_onnxruntime()
     if ort is None or not FLAT_ROOT_ONNX_MODEL_PATH.exists():
         return None
 
