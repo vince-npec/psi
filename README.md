@@ -22,6 +22,7 @@ Standard tray batches now support:
 - green and purple / anthocyanin foliage segmentation on the same tray
 - optional `ColorChecker Classic` calibration, either per-image or from a separate reference target image, for more stable canopy and leaf color traits across experiments
 - an explicit `Dataset mode` switch between `Independent batch` and `Time series batch`
+- a `Batch processing mode` switch, with `Low-memory sequential` recommended for large browser uploads on Streamlit Community Cloud
 - per-image frame ordering with parsed labels such as `round32`, `day5`, or `frame12` in time-series mode
 - batch leaf tracking across ordered uploads for the same tray sequence in time-series mode
 - interactive growth-curve plots for batch, plant, and tracked-leaf traits in time-series mode

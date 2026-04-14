@@ -49,6 +49,8 @@ SEEDLING_WORKFLOW_SINGLE = "single"
 SEEDLING_WORKFLOW_LINKED = "linked_multiview"
 DATASET_MODE_INDEPENDENT = "independent"
 DATASET_MODE_TIMESERIES = "timeseries"
+PROCESSING_MODE_LOW_MEMORY = "low_memory"
+PROCESSING_MODE_STANDARD = "standard"
 
 
 st.set_page_config(
@@ -1034,6 +1036,7 @@ def _build_batch_payload(
     rectangle_height_scales: tuple[float, ...] = (),
     color_calibration_mode: str = DEFAULT_COLOR_CALIBRATION_MODE,
     color_calibration_reference: dict[str, Any] | None = None,
+    processing_mode: str = PROCESSING_MODE_LOW_MEMORY,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     image_rows: list[dict[str, Any]] = []
@@ -1104,7 +1107,12 @@ def _build_batch_payload(
         }
         try:
             image_bytes = _get_item_bytes(item)
-            result = _analyze_upload(image_bytes=image_bytes, **analysis_kwargs)
+            if processing_mode == PROCESSING_MODE_STANDARD:
+                result = _analyze_upload(image_bytes=image_bytes, **analysis_kwargs)
+                record_result = result
+            else:
+                result = _analyze_upload_full(image_bytes=image_bytes, **analysis_kwargs)
+                record_result = None
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
                 {
@@ -1127,7 +1135,7 @@ def _build_batch_payload(
             "name": item["name"],
             "export_stem": export_stem,
             "item": item,
-            "result": result,
+            "result": record_result,
             "source_path": item.get("source_path", ""),
             "analysis_kwargs": analysis_kwargs,
         }
@@ -1242,6 +1250,7 @@ def _build_batch_payload(
         "leaf_tracks_df": leaf_tracks_df,
         "skipped_df": skipped_df,
         "dataset_mode": dataset_mode,
+        "processing_mode": processing_mode,
     }
 
 
@@ -1249,6 +1258,7 @@ def _results_zip_signature(batch_payload: dict[str, Any], results_bundle_name: s
     digest = hashlib.sha1()
     digest.update(results_bundle_name.encode("utf-8"))
     digest.update(str(batch_payload.get("dataset_mode", DATASET_MODE_INDEPENDENT)).encode("utf-8"))
+    digest.update(str(batch_payload.get("processing_mode", PROCESSING_MODE_LOW_MEMORY)).encode("utf-8"))
     for key in ("image_summary_df", "plant_summary_df", "leaf_detail_df", "leaf_tracks_df", "skipped_df"):
         csv_bytes = _csv_bytes(batch_payload[key]) if key in batch_payload and isinstance(batch_payload[key], pd.DataFrame) else b""
         digest.update(key.encode("utf-8"))
@@ -1256,8 +1266,10 @@ def _results_zip_signature(batch_payload: dict[str, Any], results_bundle_name: s
     for record in batch_payload.get("records", []):
         digest.update(str(record.get("name", "")).encode("utf-8"))
         digest.update(str(record.get("source_path", "")).encode("utf-8"))
-        digest.update(str(record["result"].container_source).encode("utf-8"))
-        digest.update(str(record["result"].scale_source).encode("utf-8"))
+        analysis_kwargs = record.get("analysis_kwargs", {})
+        for key in sorted(analysis_kwargs):
+            digest.update(str(key).encode("utf-8"))
+            digest.update(str(analysis_kwargs[key]).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -2926,7 +2938,13 @@ def _build_linked_seedling_results_bundle_bytes(batch_payload: dict[str, Any]) -
 
 
 def _render_record_detail(record: dict[str, Any]) -> None:
-    result = record["result"]
+    result = record.get("result")
+    if result is None:
+        with st.spinner("Loading image detail..."):
+            result = _analyze_upload(
+                image_bytes=_get_item_bytes(record["item"]),
+                **record["analysis_kwargs"],
+            )
     is_seedling_analysis = getattr(result, "analysis_kind", "") == ANALYSIS_KIND_SEEDLINGS
     original_preview = _preview_from_bytes(_get_item_bytes(record["item"]), MAX_PREVIEW_EDGE)
     overlay_preview = _resize_for_preview(result.overlay_rgb, MAX_PREVIEW_EDGE)
@@ -3506,6 +3524,27 @@ def main() -> None:
             "Independent batch mode treats each image separately and skips time-series ordering and leaf tracking."
         )
 
+    processing_mode = st.radio(
+        "Batch processing mode",
+        options=[PROCESSING_MODE_LOW_MEMORY, PROCESSING_MODE_STANDARD],
+        index=0,
+        horizontal=True,
+        format_func=lambda value: {
+            PROCESSING_MODE_LOW_MEMORY: "Low-memory sequential",
+            PROCESSING_MODE_STANDARD: "Standard cached",
+        }.get(value, value),
+        help="Low-memory sequential mode analyzes images one at a time and keeps only compact batch results in memory. Standard cached mode is faster for smaller batches but can be heavier on Streamlit Community Cloud.",
+    )
+    if processing_mode == PROCESSING_MODE_LOW_MEMORY:
+        st.caption(
+            "Low-memory sequential mode is recommended for large or high-resolution browser uploads. "
+            "The app keeps the batch tables light and re-runs full-resolution analysis only when you open an image detail or prepare the ZIP."
+        )
+    else:
+        st.caption(
+            "Standard cached mode keeps more analysis results ready in memory and is best for smaller batches."
+        )
+
     if color_calibration_mode == REFERENCE_COLOR_CALIBRATION_MODE and color_calibration_reference is None:
         st.info("Upload one ColorChecker reference image above. The plant-image batch will run after that calibration is ready.")
         if file_items:
@@ -3775,6 +3814,7 @@ def main() -> None:
             rectangle_height_scales=rectangle_height_scales,
             color_calibration_mode=color_calibration_mode,
             color_calibration_reference=color_calibration_reference,
+            processing_mode=processing_mode,
         )
     results_bundle_name = _results_bundle_name(file_items)
     results_zip_signature = _results_zip_signature(batch_payload, results_bundle_name)
