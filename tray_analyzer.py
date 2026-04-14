@@ -35,9 +35,22 @@ CONTAINER_MODE_FULL_IMAGE = "full_image"
 ANALYSIS_KIND_FOLIAGE = "foliage"
 ANALYSIS_KIND_SEEDLINGS = "seedlings"
 ANALYSIS_KIND_GROWTH_CHAMBER = "growth_chamber"
+COLOR_CALIBRATION_DISABLED = "disabled"
+COLOR_CALIBRATION_AUTO = "auto"
 TRAY_LONG_SIDE_CM = 33.0
 MAX_TRAY_ANALYSIS_DIM = 1400
 MAX_PLANT_ANALYSIS_DIM = 3000
+MAX_COLOR_CHECKER_ANALYSIS_DIM = 2200
+
+MACBETH_COLORCHECKER_SRGB = np.array(
+    [
+        [(115, 82, 68), (194, 150, 130), (98, 122, 157), (87, 108, 67), (133, 128, 177), (103, 189, 170)],
+        [(214, 126, 44), (80, 91, 166), (193, 90, 99), (94, 60, 108), (157, 188, 64), (224, 163, 46)],
+        [(56, 61, 150), (70, 148, 73), (175, 54, 60), (231, 199, 31), (187, 86, 149), (8, 133, 161)],
+        [(243, 243, 242), (200, 200, 200), (160, 160, 160), (122, 122, 121), (85, 85, 85), (52, 52, 52)],
+    ],
+    dtype=np.float32,
+) / 255.0
 
 
 @dataclass(frozen=True)
@@ -139,6 +152,9 @@ class TrayAnalysisResult:
     pixels_per_cm_override: float | None
     mm_per_pixel: float | None
     scale_source: str
+    color_calibration_applied: bool
+    color_calibration_source: str
+    color_calibration_loss: float | None
     plant_results: list[PlantLeafResult]
     segmentation_source: str
 
@@ -164,6 +180,13 @@ def get_container_mode_options() -> list[tuple[str, str]]:
     ]
 
 
+def get_color_calibration_options() -> list[tuple[str, str]]:
+    return [
+        (COLOR_CALIBRATION_DISABLED, "Disabled"),
+        (COLOR_CALIBRATION_AUTO, "Auto-detect ColorChecker Classic"),
+    ]
+
+
 def analyze_tray_image(
     image_rgb: np.ndarray,
     tray_profile_key: str = AUTO_TRAY_PROFILE_KEY,
@@ -182,10 +205,15 @@ def analyze_tray_image(
     rectangle_center_y_shift_ratio: float = 0.0,
     rectangle_width_scale: float = 1.0,
     rectangle_height_scale: float = 1.0,
+    color_calibration_mode: str = COLOR_CALIBRATION_DISABLED,
 ) -> TrayAnalysisResult:
     """Analyze a top-down tray image with adaptive ownership assignment across the full tray."""
     image_rgb = _normalize_rgb_image(image_rgb)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    color_stats_bgr, color_calibration_applied, color_calibration_source, color_calibration_loss = _apply_color_checker_calibration(
+        image_bgr,
+        mode=color_calibration_mode,
+    )
     circle_center_x_shift_ratio = _clip_ratio(circle_center_x_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_center_y_shift_ratio = _clip_ratio(circle_center_y_shift_ratio, 0.0, minimum=-0.75, maximum=0.75)
     circle_radius_scale = _clip_ratio(circle_radius_scale, 1.0, minimum=0.2, maximum=3.0)
@@ -197,6 +225,7 @@ def analyze_tray_image(
         return _analyze_growth_chamber_image(
             image_rgb=image_rgb,
             image_bgr=image_bgr,
+            color_stats_bgr=color_stats_bgr,
             tray_long_side_cm=tray_long_side_cm,
             pixels_per_cm_override=pixels_per_cm_override,
             container_mode=container_mode,
@@ -208,11 +237,15 @@ def analyze_tray_image(
             rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
             rectangle_width_scale=rectangle_width_scale,
             rectangle_height_scale=rectangle_height_scale,
+            color_calibration_applied=color_calibration_applied,
+            color_calibration_source=color_calibration_source,
+            color_calibration_loss=color_calibration_loss,
         )
     if tray_profile_key == SEEDLINGS_PROFILE_KEY:
         return _analyze_seedling_image(
             image_rgb=image_rgb,
             image_bgr=image_bgr,
+            color_stats_bgr=color_stats_bgr,
             tray_long_side_cm=tray_long_side_cm,
             pixels_per_cm_override=pixels_per_cm_override,
             container_mode=container_mode,
@@ -224,6 +257,9 @@ def analyze_tray_image(
             rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
             rectangle_width_scale=rectangle_width_scale,
             rectangle_height_scale=rectangle_height_scale,
+            color_calibration_applied=color_calibration_applied,
+            color_calibration_source=color_calibration_source,
+            color_calibration_loss=color_calibration_loss,
         )
     tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
         image_bgr,
@@ -276,6 +312,7 @@ def analyze_tray_image(
         )
         crop_x0, crop_y0, crop_x1, crop_y1 = analysis_bbox
         crop_bgr = image_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
+        crop_color_bgr = color_stats_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
         crop_raw_mask_u8 = _segment_leaf_mask(crop_bgr)
         plant_mask_u8 = cv2.bitwise_and(crop_raw_mask_u8, owned_mask_u8)
         plant_mask_u8 = cv2.bitwise_and(plant_mask_u8, container_mask_u8[crop_y0:crop_y1, crop_x0:crop_x1])
@@ -290,7 +327,7 @@ def analyze_tray_image(
             expected_groups=1,
         )
         plant_traits, plant_leaf_rows = _compute_trait_rows(
-            crop_bgr=crop_bgr,
+            crop_bgr=crop_color_bgr,
             mask_u8=plant_mask_u8,
             leaf_label_map=plant_label_map,
             site=site,
@@ -305,6 +342,9 @@ def analyze_tray_image(
             rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
             rectangle_width_scale=rectangle_width_scale,
             rectangle_height_scale=rectangle_height_scale,
+            color_calibration_applied=color_calibration_applied,
+            color_calibration_source=color_calibration_source,
+            color_calibration_loss=color_calibration_loss,
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
@@ -362,6 +402,9 @@ def analyze_tray_image(
         pixels_per_cm_override=pixels_per_cm_override,
         mm_per_pixel=mm_per_pixel,
         scale_source=scale_source,
+        color_calibration_applied=color_calibration_applied,
+        color_calibration_source=color_calibration_source,
+        color_calibration_loss=color_calibration_loss,
         plant_results=plant_results,
         segmentation_source=segmentation_source,
     )
@@ -370,6 +413,7 @@ def analyze_tray_image(
 def _analyze_growth_chamber_image(
     image_rgb: np.ndarray,
     image_bgr: np.ndarray,
+    color_stats_bgr: np.ndarray,
     tray_long_side_cm: float,
     pixels_per_cm_override: float | None,
     container_mode: str,
@@ -381,6 +425,9 @@ def _analyze_growth_chamber_image(
     rectangle_center_y_shift_ratio: float,
     rectangle_width_scale: float,
     rectangle_height_scale: float,
+    color_calibration_applied: bool,
+    color_calibration_source: str,
+    color_calibration_loss: float | None,
 ) -> TrayAnalysisResult:
     tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
         image_bgr,
@@ -438,6 +485,7 @@ def _analyze_growth_chamber_image(
             tray_y0 + component["bbox_local"][3],
         )
         crop_bgr = image_bgr[analysis_bbox[1] : analysis_bbox[3], analysis_bbox[0] : analysis_bbox[2]]
+        crop_color_bgr = color_stats_bgr[analysis_bbox[1] : analysis_bbox[3], analysis_bbox[0] : analysis_bbox[2]]
         component_mask_u8 = (
             (component_labels[local_y0:local_y1, local_x0:local_x1] == int(component["label_id"])).astype(np.uint8) * 255
         )
@@ -455,7 +503,7 @@ def _analyze_growth_chamber_image(
             bbox=component_bbox,
         )
         plant_traits, plant_leaf_rows = _compute_trait_rows(
-            crop_bgr=crop_bgr,
+            crop_bgr=crop_color_bgr,
             mask_u8=component_mask_u8,
             leaf_label_map=leaf_label_map,
             site=site,
@@ -470,6 +518,9 @@ def _analyze_growth_chamber_image(
             rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
             rectangle_width_scale=rectangle_width_scale,
             rectangle_height_scale=rectangle_height_scale,
+            color_calibration_applied=color_calibration_applied,
+            color_calibration_source=color_calibration_source,
+            color_calibration_loss=color_calibration_loss,
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
@@ -530,6 +581,9 @@ def _analyze_growth_chamber_image(
         pixels_per_cm_override=pixels_per_cm_override,
         mm_per_pixel=mm_per_pixel,
         scale_source=scale_source,
+        color_calibration_applied=color_calibration_applied,
+        color_calibration_source=color_calibration_source,
+        color_calibration_loss=color_calibration_loss,
         plant_results=plant_results,
         segmentation_source="Growth chamber vegetation threshold",
     )
@@ -538,6 +592,7 @@ def _analyze_growth_chamber_image(
 def _analyze_seedling_image(
     image_rgb: np.ndarray,
     image_bgr: np.ndarray,
+    color_stats_bgr: np.ndarray,
     tray_long_side_cm: float,
     pixels_per_cm_override: float | None,
     container_mode: str,
@@ -549,6 +604,9 @@ def _analyze_seedling_image(
     rectangle_center_y_shift_ratio: float,
     rectangle_width_scale: float,
     rectangle_height_scale: float,
+    color_calibration_applied: bool,
+    color_calibration_source: str,
+    color_calibration_loss: float | None,
 ) -> TrayAnalysisResult:
     tray_bbox, tray_long_side_px, container_mask_u8, container_source = _detect_container_geometry(
         image_bgr,
@@ -593,6 +651,7 @@ def _analyze_seedling_image(
         )
         crop_x0, crop_y0, crop_x1, crop_y1 = analysis_bbox
         crop_bgr = image_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
+        crop_color_bgr = color_stats_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
         crop_container_mask_u8 = container_mask_u8[crop_y0:crop_y1, crop_x0:crop_x1]
         crop_shoot_mask_u8 = global_shoot_mask_u8[crop_y0:crop_y1, crop_x0:crop_x1].copy()
         crop_shoot_mask_u8 = cv2.bitwise_and(crop_shoot_mask_u8, crop_container_mask_u8)
@@ -611,7 +670,7 @@ def _analyze_seedling_image(
         )
 
         root_support_mask_u8 = _segment_seedling_root_support_mask(
-            crop_bgr=crop_bgr,
+            crop_bgr=crop_color_bgr,
             crop_shoot_mask_u8=crop_shoot_mask_u8,
             crop_container_mask_u8=crop_container_mask_u8,
             anchor_local=anchor_local,
@@ -660,6 +719,9 @@ def _analyze_seedling_image(
             rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
             rectangle_width_scale=rectangle_width_scale,
             rectangle_height_scale=rectangle_height_scale,
+            color_calibration_applied=color_calibration_applied,
+            color_calibration_source=color_calibration_source,
+            color_calibration_loss=color_calibration_loss,
             tray_long_side_cm=tray_long_side_cm,
             tray_long_side_px=tray_long_side_px,
             pixels_per_cm=pixels_per_cm,
@@ -743,6 +805,9 @@ def _analyze_seedling_image(
         pixels_per_cm_override=pixels_per_cm_override,
         mm_per_pixel=mm_per_pixel,
         scale_source=scale_source,
+        color_calibration_applied=color_calibration_applied,
+        color_calibration_source=color_calibration_source,
+        color_calibration_loss=color_calibration_loss,
         plant_results=plant_results,
         segmentation_source="Seedling heuristic (green shoot mask + anchored root skeleton)",
     )
@@ -2544,6 +2609,159 @@ def _downscale_for_analysis(image: np.ndarray, max_dim: int) -> tuple[np.ndarray
     return resized, scale
 
 
+def _apply_color_checker_calibration(
+    image_bgr: np.ndarray,
+    mode: str = COLOR_CALIBRATION_DISABLED,
+) -> tuple[np.ndarray, bool, str, float | None]:
+    if mode != COLOR_CALIBRATION_AUTO:
+        return image_bgr, False, "Disabled", None
+    if not hasattr(cv2, "mcc"):
+        return image_bgr, False, "OpenCV ColorChecker detector unavailable", None
+
+    working_bgr, _ = _downscale_for_analysis(image_bgr, MAX_COLOR_CHECKER_ANALYSIS_DIM)
+    try:
+        detector = cv2.mcc.CCheckerDetector_create()
+        detected = detector.process(working_bgr, cv2.mcc.MCC24, 1)
+    except Exception:
+        return image_bgr, False, "ColorChecker detection failed", None
+
+    if not detected:
+        return image_bgr, False, "No ColorChecker detected", None
+
+    checker = detector.getBestColorChecker()
+    fit_result = _fit_color_checker_affine_transform(checker)
+    if fit_result is None:
+        return image_bgr, False, "ColorChecker detected but calibration fit failed", None
+
+    fit_loss = float(fit_result["loss"])
+    if not np.isfinite(fit_loss) or fit_loss > 0.14:
+        return image_bgr, False, "ColorChecker detected but calibration rejected", fit_loss
+
+    corrected_bgr = _apply_affine_color_transform(
+        image_bgr,
+        fit_result["matrix"],
+        fit_result["bias"],
+    )
+    source = f"Detected ColorChecker Classic ({fit_result['layout_label']}, rotation {int(fit_result['rotation'])})"
+    return corrected_bgr, True, source, fit_loss
+
+
+def _fit_color_checker_affine_transform(checker: object | None) -> dict[str, object] | None:
+    if checker is None:
+        return None
+
+    try:
+        chart_stats = np.array(checker.getChartsRGB(), dtype=np.float32)
+        color_chart_points = np.array(checker.getColorCharts(), dtype=np.float32)
+    except Exception:
+        return None
+
+    if chart_stats.shape != (72, 5) or color_chart_points.shape != (96, 2):
+        return None
+
+    observed_rgb = chart_stats.reshape(24, 3, 5)[:, :, 1] / 255.0
+    patch_points = color_chart_points.reshape(24, 4, 2)
+    patch_centers = patch_points.mean(axis=1)
+
+    best_result: dict[str, object] | None = None
+    for rows, cols, layout_label in ((6, 4, "portrait"), (4, 6, "landscape")):
+        observed_grid = _assign_color_checker_grid(observed_rgb, patch_centers, rows=rows, cols=cols)
+        if observed_grid is None:
+            continue
+        for rotation in range(4):
+            reference_grid = np.rot90(MACBETH_COLORCHECKER_SRGB, rotation)
+            if reference_grid.shape[:2] != observed_grid.shape[:2]:
+                continue
+            fit = _solve_affine_rgb_transform(
+                observed_grid.reshape(-1, 3),
+                reference_grid.reshape(-1, 3),
+            )
+            if fit is None:
+                continue
+            candidate = {
+                "layout_label": layout_label,
+                "rotation": rotation,
+                "matrix": fit["matrix"],
+                "bias": fit["bias"],
+                "loss": fit["loss"],
+            }
+            if best_result is None or float(candidate["loss"]) < float(best_result["loss"]):
+                best_result = candidate
+
+    return best_result
+
+
+def _assign_color_checker_grid(
+    observed_rgb: np.ndarray,
+    patch_centers: np.ndarray,
+    rows: int,
+    cols: int,
+) -> np.ndarray | None:
+    patch_count = int(observed_rgb.shape[0])
+    if patch_count != rows * cols or patch_centers.shape != (patch_count, 2):
+        return None
+
+    x_order = np.argsort(patch_centers[:, 0])
+    col_ids = np.full(patch_count, -1, dtype=np.int32)
+    for col_index, group_indices in enumerate(np.array_split(x_order, cols)):
+        if group_indices.size != rows:
+            return None
+        col_ids[group_indices] = int(col_index)
+
+    row_ids = np.full(patch_count, -1, dtype=np.int32)
+    for col_index in range(cols):
+        column_patch_ids = np.where(col_ids == col_index)[0]
+        if column_patch_ids.size != rows:
+            return None
+        sorted_patch_ids = column_patch_ids[np.argsort(patch_centers[column_patch_ids, 1])]
+        for row_index, patch_index in enumerate(sorted_patch_ids):
+            row_ids[patch_index] = int(row_index)
+
+    if np.any(row_ids < 0):
+        return None
+
+    grid = np.zeros((rows, cols, 3), dtype=np.float32)
+    for patch_index in range(patch_count):
+        grid[int(row_ids[patch_index]), int(col_ids[patch_index])] = observed_rgb[patch_index]
+    return grid
+
+
+def _solve_affine_rgb_transform(
+    observed_rgb: np.ndarray,
+    reference_rgb: np.ndarray,
+) -> dict[str, object] | None:
+    if observed_rgb.shape != reference_rgb.shape or observed_rgb.ndim != 2 or observed_rgb.shape[1] != 3:
+        return None
+
+    src = np.asarray(observed_rgb, dtype=np.float32)
+    dst = np.asarray(reference_rgb, dtype=np.float32)
+    src_augmented = np.concatenate([src, np.ones((src.shape[0], 1), dtype=np.float32)], axis=1)
+    try:
+        transform, _, _, _ = np.linalg.lstsq(src_augmented, dst, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    predicted = np.clip(src_augmented @ transform, 0.0, 1.0)
+    loss = float(np.sqrt(np.mean((predicted - dst) ** 2)))
+    return {
+        "matrix": transform[:3, :].astype(np.float32),
+        "bias": transform[3, :].astype(np.float32),
+        "loss": loss,
+    }
+
+
+def _apply_affine_color_transform(
+    image_bgr: np.ndarray,
+    matrix: np.ndarray,
+    bias: np.ndarray,
+) -> np.ndarray:
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    flat_rgb = image_rgb.reshape(-1, 3)
+    corrected_rgb = np.clip((flat_rgb @ matrix) + bias, 0.0, 1.0).reshape(image_rgb.shape)
+    corrected_rgb_u8 = np.clip(np.round(corrected_rgb * 255.0), 0, 255).astype(np.uint8)
+    return cv2.cvtColor(corrected_rgb_u8, cv2.COLOR_RGB2BGR)
+
+
 def _suppress_spurious_small_masks(
     plant_mask_u8: np.ndarray,
     analysis_bbox: tuple[int, int, int, int],
@@ -2601,6 +2819,9 @@ def _compute_trait_rows(
     pixels_per_cm_override: float | None,
     mm_per_pixel: float | None,
     scale_source: str,
+    color_calibration_applied: bool,
+    color_calibration_source: str,
+    color_calibration_loss: float | None,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     binary = mask_u8 > 0
     canopy_stats = _shape_stats_from_mask(binary)
@@ -2652,6 +2873,9 @@ def _compute_trait_rows(
                 "Rectangle Width Scale (%)": _round_or_none(rectangle_width_scale * 100.0, 2),
                 "Rectangle Height Scale (%)": _round_or_none(rectangle_height_scale * 100.0, 2),
                 "Scale Source": scale_source,
+                "Color Calibration Applied": bool(color_calibration_applied),
+                "Color Calibration Source": color_calibration_source,
+                "Color Calibration Loss": _round_or_none(color_calibration_loss, 6),
                 "Pixels Per Cm Override": pixels_per_cm_override,
                 "Leaf ID": int(leaf_id),
                 "Ownership Distance (px)": _round_or_none(ownership_distance_px, 2),
@@ -2718,6 +2942,9 @@ def _compute_trait_rows(
         "Rectangle Width Scale (%)": _round_or_none(rectangle_width_scale * 100.0, 2),
         "Rectangle Height Scale (%)": _round_or_none(rectangle_height_scale * 100.0, 2),
         "Scale Source": scale_source,
+        "Color Calibration Applied": bool(color_calibration_applied),
+        "Color Calibration Source": color_calibration_source,
+        "Color Calibration Loss": _round_or_none(color_calibration_loss, 6),
         "Tray Long Side (px)": _round_or_none(tray_long_side_px, 2),
         "Tray Long Side (cm)": float(tray_long_side_cm),
         "Pixels Per Cm": pixels_per_cm,

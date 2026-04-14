@@ -32,6 +32,8 @@ TRAY_PROFILE_OPTIONS = tray_analyzer.get_tray_profile_options()
 TRAY_PROFILE_LABELS = {key: label for key, label in TRAY_PROFILE_OPTIONS}
 CONTAINER_MODE_OPTIONS = tray_analyzer.get_container_mode_options()
 CONTAINER_MODE_LABELS = {key: label for key, label in CONTAINER_MODE_OPTIONS}
+COLOR_CALIBRATION_OPTIONS = tray_analyzer.get_color_calibration_options()
+COLOR_CALIBRATION_LABELS = {key: label for key, label in COLOR_CALIBRATION_OPTIONS}
 DEFAULT_TRAY_PROFILE_KEY = getattr(tray_analyzer, "AUTO_TRAY_PROFILE_KEY", TRAY_PROFILE_OPTIONS[0][0])
 CUSTOM_TRAY_PROFILE_KEY = getattr(tray_analyzer, "CUSTOM_TRAY_PROFILE_KEY", "custom")
 SEEDLINGS_PROFILE_KEY = getattr(tray_analyzer, "SEEDLINGS_PROFILE_KEY", "seedlings")
@@ -43,6 +45,7 @@ ANALYSIS_KIND_SEEDLINGS = getattr(tray_analyzer, "ANALYSIS_KIND_SEEDLINGS", "see
 FULL_IMAGE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_FULL_IMAGE", "full_image")
 RECTANGLE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_RECTANGLE", "rectangle")
 CIRCLE_CONTAINER_MODE = getattr(tray_analyzer, "CONTAINER_MODE_CIRCLE", "circle")
+DEFAULT_COLOR_CALIBRATION_MODE = getattr(tray_analyzer, "COLOR_CALIBRATION_DISABLED", "disabled")
 
 SEEDLING_WORKFLOW_SINGLE = "single"
 SEEDLING_WORKFLOW_LINKED = "linked_multiview"
@@ -451,6 +454,7 @@ def _analyze_upload(
     rectangle_center_y_shift_ratio: float = 0.0,
     rectangle_width_scale: float = 1.0,
     rectangle_height_scale: float = 1.0,
+    color_calibration_mode: str = DEFAULT_COLOR_CALIBRATION_MODE,
 ):
     image = _open_rgb_image(image_bytes)
     return analyze_tray_image(
@@ -470,6 +474,7 @@ def _analyze_upload(
         rectangle_center_y_shift_ratio=rectangle_center_y_shift_ratio,
         rectangle_width_scale=rectangle_width_scale,
         rectangle_height_scale=rectangle_height_scale,
+        color_calibration_mode=color_calibration_mode,
     )
 
 
@@ -923,6 +928,9 @@ def _build_results_bundle_bytes(batch_payload: dict[str, Any]) -> bytes:
                         f"Rectangle Width (%): {round(float(result.rectangle_width_scale) * 100.0, 2)}",
                         f"Rectangle Height (%): {round(float(result.rectangle_height_scale) * 100.0, 2)}",
                         f"Scale Source: {result.scale_source}",
+                        f"Color Calibration Applied: {bool(result.color_calibration_applied)}",
+                        f"Color Calibration Source: {result.color_calibration_source}",
+                        f"Color Calibration Loss: {result.color_calibration_loss}",
                         f"Tray Long Side (cm): {result.tray_long_side_cm}",
                         f"Tray Long Side (px): {result.tray_long_side_px}",
                         f"Pixels Per Cm Override: {result.pixels_per_cm_override}",
@@ -954,6 +962,7 @@ def _build_batch_payload(
     rectangle_center_y_shift_ratios: tuple[float, ...] = (),
     rectangle_width_scales: tuple[float, ...] = (),
     rectangle_height_scales: tuple[float, ...] = (),
+    color_calibration_mode: str = DEFAULT_COLOR_CALIBRATION_MODE,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     image_rows: list[dict[str, Any]] = []
@@ -1022,6 +1031,7 @@ def _build_batch_payload(
                 rectangle_center_y_shift_ratio=float(rectangle_center_y_shift_ratio),
                 rectangle_width_scale=float(rectangle_width_scale),
                 rectangle_height_scale=float(rectangle_height_scale),
+                color_calibration_mode=str(color_calibration_mode),
             )
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             skipped_items.append(
@@ -1076,6 +1086,9 @@ def _build_batch_payload(
             "Rectangle Width (%)": round(float(result.rectangle_width_scale) * 100.0, 2),
             "Rectangle Height (%)": round(float(result.rectangle_height_scale) * 100.0, 2),
             "Scale Source": result.scale_source,
+            "Color Calibration Applied": bool(result.color_calibration_applied),
+            "Color Calibration Source": result.color_calibration_source,
+            "Color Calibration Loss": result.color_calibration_loss,
             "Estimated Leaves": int(result.plant_summary_df["Estimated Leaves"].sum()),
             "Total Canopy Area (px)": int(result.plant_summary_df["Canopy Area (px)"].sum()),
             "Total Canopy Area (cm^2)": round(float(result.plant_summary_df["Canopy Area (cm^2)"].fillna(0).sum()), 4),
@@ -1465,6 +1478,7 @@ def _timeseries_metric_columns(df: pd.DataFrame) -> list[str]:
         "Pixels Per Cm",
         "Pixels Per Cm Override",
         "Mm Per Pixel",
+        "Color Calibration Loss",
         "Track Matched From Previous",
         "Track Match Distance (px)",
         "Track Area Ratio",
@@ -2867,6 +2881,14 @@ def _render_record_detail(record: dict[str, Any]) -> None:
             f"Layout: {result.tray_profile_name} | Container: {result.container_source} | Scale: {result.scale_source} | Segmentation: {result.segmentation_source} | "
             f"Tray long side: {result.tray_long_side_cm:.1f} cm = {result.tray_long_side_px:.1f} px"
         )
+        st.caption(
+            f"Color calibration: {result.color_calibration_source}"
+            + (
+                f" | patch fit loss {round(float(result.color_calibration_loss), 4)}"
+                if result.color_calibration_loss is not None
+                else ""
+            )
+        )
         if "circular pot" in str(result.container_source).lower():
             st.caption(
                 f"Circle adjustment: x {round(float(result.circle_center_x_shift_ratio) * 100.0, 1)}% | "
@@ -3213,6 +3235,25 @@ def main() -> None:
         ),
         format_func=lambda key: CONTAINER_MODE_LABELS.get(key, key),
     )
+    calibration_col_1, calibration_col_2 = st.columns([0.85, 1.15])
+    color_calibration_mode = calibration_col_1.selectbox(
+        "Color calibration target",
+        options=[key for key, _ in COLOR_CALIBRATION_OPTIONS],
+        index=next(
+            (idx for idx, (key, _) in enumerate(COLOR_CALIBRATION_OPTIONS) if key == DEFAULT_COLOR_CALIBRATION_MODE),
+            0,
+        ),
+        format_func=lambda key: COLOR_CALIBRATION_LABELS.get(key, key),
+    )
+    with calibration_col_2:
+        if color_calibration_mode != DEFAULT_COLOR_CALIBRATION_MODE:
+            st.caption(
+                "When a ColorChecker Classic is visible, the app fits a per-image color correction before computing canopy and leaf color traits."
+            )
+        else:
+            st.caption(
+                "Leave this disabled for regular runs. Turn it on when each image includes a ColorChecker Classic target and you want more stable color traits across settings."
+            )
     if tray_profile_key == DEFAULT_TRAY_PROFILE_KEY:
         st.caption("Auto layout chooses between a 4-plant 2x2 tray and a 20-plant 4x5 Arabidopsis tray from the canopy pattern.")
     if tray_profile_key == LETTUCE_2X2_PROFILE_KEY:
@@ -3622,6 +3663,7 @@ def main() -> None:
             rectangle_center_y_shift_ratios=rectangle_center_y_shift_ratios,
             rectangle_width_scales=rectangle_width_scales,
             rectangle_height_scales=rectangle_height_scales,
+            color_calibration_mode=color_calibration_mode,
         )
     results_bundle_name = _results_bundle_name(file_items)
     results_zip_signature = _results_zip_signature(batch_payload, results_bundle_name)

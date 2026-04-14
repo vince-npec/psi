@@ -20,6 +20,7 @@ Streamlit Community Cloud app for tray, chamber, and seedling phenotyping.
 Standard tray batches now support:
 
 - green and purple / anthocyanin foliage segmentation on the same tray
+- optional per-image `ColorChecker Classic` calibration for more stable canopy and leaf color traits across experiments
 - an explicit `Dataset mode` switch between `Independent batch` and `Time series batch`
 - per-image frame ordering with parsed labels such as `round32`, `day5`, or `frame12` in time-series mode
 - batch leaf tracking across ordered uploads for the same tray sequence in time-series mode
@@ -53,6 +54,7 @@ Outputs include:
 
 - Use `Tray long side (cm)` when a tray scale is visible.
 - Use `Pixels Per Cm Override` when no tray scale is available.
+- Use `Color calibration target = Auto-detect ColorChecker Classic` when each image contains a visible ColorChecker Classic card.
 - In linked seedling experiments, top, side, and flat images each have their own manual `pixels / cm` input.
 - For flat seedling root images on dark backgrounds, `Full image` is usually the right container mode.
 
